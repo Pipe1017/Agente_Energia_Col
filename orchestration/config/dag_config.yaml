@@ -1,0 +1,218 @@
+# =============================================================================
+# Configuración central de todos los DAGs de Agente Energía Colombia
+# =============================================================================
+# Este archivo documenta los parámetros clave de cada DAG.
+# Los valores aquí son INFORMATIVOS — los DAGs usan variables de Airflow
+# o env vars cuando necesitan configuración dinámica en producción.
+# =============================================================================
+
+schedules:
+  xm_ingestion:       "@hourly"          # cada hora en punto
+  feature_engineering: "15 */2 * * *"   # cada 2h a los :15 min
+  model_training:     "0 2 * * *"        # diario 02:00 Bogotá
+  model_promotion:    "0 3 * * *"        # diario 03:00 Bogotá
+  llm_analysis:       "30 * * * *"       # cada hora a los :30 min
+
+# Orden cronológico de ejecución en cada ciclo horario:
+# 00:00 → xm_ingestion (descarga datos XM)
+# 00:15 → feature_engineering (construye features)
+# 00:30 → llm_analysis (predicciones + recomendaciones LLM)
+# 02:00 → model_training (solo diario — entrena challenger)
+# 03:00 → model_promotion (solo diario — compara champion vs challenger)
+
+# -----------------------------------------------------------------------------
+# XM Ingestion
+# -----------------------------------------------------------------------------
+xm_ingestion:
+  lookback_days: 2          # re-descarga últimos 2 días (idempotente)
+  hydrology_lookback: 3     # aportes hídricos: 3 días (disponibilidad retrasada)
+  reservoir_lookback: 3     # embalses: 3 días
+  retries: 3
+  retry_delay_minutes: 5
+  max_retry_delay_minutes: 30
+
+  metrics:
+    - name: PrecioMercado
+      entity: Sistema
+      granularity: hourly
+      target_column: spot_price_cop
+      critical: true
+
+    - name: DemandaComercial
+      entity: Sistema
+      granularity: hourly
+      target_column: demand_mwh
+      critical: true
+
+    - name: AportesHidro
+      entity: Sistema
+      granularity: daily
+      target_column: hydrology_pct
+      critical: false       # puede llegar con retraso de 1-2 días
+
+    - name: NivelEmbalse
+      entity: Sistema
+      granularity: daily
+      target_column: reservoir_level_pct
+      critical: false
+
+    - name: GeneracionTermica
+      entity: Sistema
+      granularity: hourly
+      target_column: thermal_dispatch_pct
+      critical: false       # no crítico — usa valor por defecto 15%
+
+  fallback_values:
+    hydrology_pct: 85.0         # % histórico promedio si no hay dato
+    reservoir_level_pct: 55.0   # % capacidad promedio Colombia
+    thermal_dispatch_pct: 15.0  # % despacho térmico típico
+
+# -----------------------------------------------------------------------------
+# Feature Engineering
+# -----------------------------------------------------------------------------
+feature_engineering:
+  lookback_days_load: 14    # días a cargar para calcular lags (168h = 7 días)
+  output_window_days: 7     # días de features a persistir (sin buffer de lags)
+  retries: 2
+  retry_delay_minutes: 10
+
+  features:
+    # Temporales
+    - hour_of_day
+    - day_of_week
+    - month
+    - quarter
+    - is_holiday
+    - is_pre_holiday
+    - is_weekend
+    # Cíclicas
+    - sin_hour
+    - cos_hour
+    - sin_dow
+    - cos_dow
+    - sin_month
+    - cos_month
+    # Mercado XM
+    - spot_price_cop
+    - demand_mwh
+    - hydrology_pct
+    - reservoir_level_pct
+    - thermal_dispatch_pct
+    # Lags precio
+    - price_lag_1h
+    - price_lag_2h
+    - price_lag_3h
+    - price_lag_6h
+    - price_lag_12h
+    - price_lag_24h
+    - price_lag_48h
+    - price_lag_168h
+    # Rolling stats precio
+    - price_rolling_mean_6h
+    - price_rolling_mean_24h
+    - price_rolling_std_24h
+    - price_rolling_max_24h
+    - price_rolling_min_24h
+    # Rolling stats demanda
+    - demand_lag_24h
+    - demand_rolling_mean_24h
+    # Ratios
+    - hydrology_x_reservoir
+    - thermal_ratio
+
+  total_features: 37
+
+# -----------------------------------------------------------------------------
+# Model Training
+# -----------------------------------------------------------------------------
+model_training:
+  train_lookback_days: 90   # días de datos para entrenamiento
+  val_days: 7               # días para validación (split temporal)
+  retries: 1
+  retry_delay_minutes: 15
+
+  quality_thresholds:
+    max_rmse_cop_kwh: 100.0  # COP/kWh — rechazar si RMSE > 100
+    max_mape_pct: 25.0       # % — rechazar si MAPE > 25%
+    min_training_rows: 200   # mínimo de filas para entrenar
+
+  xgboost_params:
+    n_estimators: 500
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    tree_method: hist        # compatible ARM + x86, sin CUDA
+    device: cpu
+    early_stopping_rounds: 50
+
+  quantile_models:
+    low: 0.05    # intervalo inferior 90% confianza
+    high: 0.95   # intervalo superior 90% confianza
+
+# -----------------------------------------------------------------------------
+# Model Promotion
+# -----------------------------------------------------------------------------
+model_promotion:
+  primary_metric: rmse
+  min_improvement_pct: 2.0   # % mínimo de mejora en RMSE para promover
+  secondary_metrics:
+    - mae
+    - mape
+    - r2
+
+  stages:
+    training_output: dev
+    evaluated_not_promoted: staging
+    promoted: production
+    replaced_champion: archived
+
+# -----------------------------------------------------------------------------
+# LLM Analysis
+# -----------------------------------------------------------------------------
+llm_analysis:
+  schedule_offset_minutes: 30   # ejecuta 30min después de xm_ingestion
+  retries: 2
+  retry_delay_minutes: 5
+
+  deepseek:
+    model: deepseek-chat
+    temperature: 0.3
+    max_tokens: 800
+    response_format: json_object
+
+  prediction_horizon_hours: 24
+
+  # Agentes activos para generación de recomendaciones
+  # Ampliar con nuevos agentes SIC cuando se incorporen
+  active_agents:
+    - sic_code: EPMC
+      name: "EPM Ituango"
+    - sic_code: CLSI
+      name: "Celsia"
+    - sic_code: EMGS
+      name: "Emgesa"
+
+  prompts:
+    hydrology_thresholds:
+      critical_below: 60    # % del histórico — "CRÍTICA"
+      low_below: 80         # % del histórico — "BAJA"
+
+# -----------------------------------------------------------------------------
+# Retención de datos
+# -----------------------------------------------------------------------------
+retention:
+  market_data_days: 730      # 2 años de datos de mercado
+  features_cache_days: 90    # 3 meses de features
+  recommendations_days: 365  # 1 año de recomendaciones
+  raw_data_minio_days: 90    # 3 meses de raw parquet
+  model_artifacts_days: 365  # 1 año de artefactos ML
+
+# -----------------------------------------------------------------------------
+# MinIO buckets
+# -----------------------------------------------------------------------------
+minio_buckets:
+  raw_data: raw-data
+  features: features
+  models: models
+  reports: reports

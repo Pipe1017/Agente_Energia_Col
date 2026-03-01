@@ -1,0 +1,71 @@
+# ============================================================
+# Agente Energia Col — Overrides de Desarrollo (Mac M4)
+# Uso: docker compose -f infra/docker-compose.yml -f infra/docker-compose.dev.yml up -d
+# Atajo:  make dev
+# ============================================================
+
+services:
+
+  # Airflow en modo LocalExecutor (sin worker, más simple para dev)
+  airflow-webserver:
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${AIRFLOW_DB:-airflow}
+      # Sobreescribir: LocalExecutor no necesita Celery
+      AIRFLOW__CELERY__BROKER_URL: ""
+      AIRFLOW__CELERY__RESULT_BACKEND: ""
+
+  airflow-scheduler:
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${AIRFLOW_DB:-airflow}
+
+  # Deshabilitar worker en dev (LocalExecutor ejecuta tareas en el scheduler)
+  airflow-worker:
+    profiles:
+      - prod-only
+
+  # API con hot reload y debugger
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      target: development
+    command: uvicorn src.interfaces.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ../backend/src:/app/src
+      - ../shared:/app/shared
+    environment:
+      DEBUG: "true"
+      LOG_LEVEL: debug
+    ports:
+      - "${API_PORT:-8000}:8000"
+      - "5678:5678"  # debugpy (VS Code remote debug)
+
+  # Redis expuesto para inspección local
+  redis:
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+
+  # JupyterLab para experimentación con datos y modelos
+  jupyter:
+    image: jupyter/scipy-notebook:python-3.11
+    volumes:
+      - ../ml:/home/jovyan/ml
+      - ../shared:/home/jovyan/shared
+      - ../orchestration:/home/jovyan/orchestration
+    ports:
+      - "8888:8888"
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+    networks:
+      - backend-net
+    restart: unless-stopped

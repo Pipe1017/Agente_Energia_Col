@@ -1,0 +1,61 @@
+# ============================================================
+# Agente Energia Col — .gitignore
+# ============================================================
+
+# Secrets — NUNCA versionar
+.env
+infra/docker-compose.override.yml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ML artifacts (se almacenan en MinIO, no en git)
+ml/models/*.pkl
+ml/models/*.joblib
+ml/models/*.pt
+ml/models/*.onnx
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.next/
+frontend/build/
+
+# Docker volumes (si se mapean localmente)
+.docker-data/
+
+# IDEs
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Alembic (versiones sí van a git, el cache no)
+backend/src/infrastructure/db/migrations/__pycache__/
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
