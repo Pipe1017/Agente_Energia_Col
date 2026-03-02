@@ -23,6 +23,13 @@ dependencies = [
     # HTTP cliente (XM API + Deepseek)
     "httpx>=0.27",
     "openai>=1.30",       # Deepseek usa protocolo compatible con OpenAI
+    # LangChain — abstracción de proveedor LLM
+    "langchain>=0.3",
+    "langchain-openai>=0.2",      # ChatOpenAI: Deepseek + OpenAI
+    "langchain-ollama>=0.2",      # ChatOllama: desarrollo local
+    "langchain-core>=0.3",
+    # MLflow — registro y tracking de modelos ML
+    "mlflow>=2.13",
     # ML / Data
     "pydataxm>=0.5",
     "pandas>=2.0",

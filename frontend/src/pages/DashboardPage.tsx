@@ -5,7 +5,7 @@ import { RecommendationCard } from '@/components/RecommendationCard'
 import { useRecommendation } from '@/hooks/useRecommendation'
 import { usePrediction } from '@/hooks/usePrediction'
 import { useMarketLatest } from '@/hooks/useMarket'
-import { formatCOP, formatRelative, riskLabel, riskColor, hydrologyColor, cn } from '@/lib/utils'
+import { formatCOP, formatRelative, riskLabel, hydrologyColor, cn } from '@/lib/utils'
 import { Sparkles, TrendingUp, Droplets, Activity } from 'lucide-react'
 import { Card, CardBody } from '@/components/ui/Card'
 

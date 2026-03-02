@@ -12,6 +12,7 @@ mc mb --ignore-existing local/raw-data
 mc mb --ignore-existing local/features
 mc mb --ignore-existing local/models
 mc mb --ignore-existing local/reports
+mc mb --ignore-existing local/mlflow
 
 echo "Configurando políticas de retención..."
 # raw-data: retener 90 días

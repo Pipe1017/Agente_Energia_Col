@@ -35,18 +35,36 @@ def get_minio_client():
     )
 
 
-def get_model_registry():
-    """ModelRegistry para guardar/cargar artefactos ML."""
-    import sys
-    from pathlib import Path
+def get_mlflow_client():
+    """MLflow tracking client configurado con MinIO como artifact store."""
+    import mlflow
+    from mlflow.tracking import MlflowClient
 
-    sys.path.insert(0, "/opt/airflow/ml")
-    from registry.model_registry import ModelRegistry
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+    mlflow.set_tracking_uri(tracking_uri)
 
-    return ModelRegistry(
-        minio_endpoint=os.environ["MINIO_ENDPOINT"],
-        minio_user=os.environ["MINIO_ROOT_USER"],
-        minio_password=os.environ["MINIO_ROOT_PASSWORD"],
+    # Configurar credenciales S3/MinIO para artefactos
+    os.environ.setdefault("MLFLOW_S3_ENDPOINT_URL",
+                          f"http://{os.environ.get('MINIO_ENDPOINT', 'minio:9000')}")
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", os.environ.get("MINIO_ROOT_USER", ""))
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", os.environ.get("MINIO_ROOT_PASSWORD", ""))
+
+    return MlflowClient(tracking_uri=tracking_uri)
+
+
+def get_or_create_mlflow_experiment(name: str) -> str:
+    """Retorna el experiment_id, creándolo si no existe."""
+    import mlflow
+
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+    mlflow.set_tracking_uri(tracking_uri)
+
+    experiment = mlflow.get_experiment_by_name(name)
+    if experiment:
+        return experiment.experiment_id
+    return mlflow.create_experiment(
+        name,
+        artifact_location="s3://mlflow/",
     )
 
 

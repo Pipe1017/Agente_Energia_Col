@@ -44,77 +44,82 @@ def model_promotion_dag():
     @task(task_id="get_champion")
     def get_champion() -> dict:
         """
-        Obtiene el modelo champion actual (stage='production', is_champion=True).
+        Obtiene el modelo champion actual (MLflow stage='Production').
         Retorna {} si no existe champion (primera vez).
         """
-        import sys
+        import sys, os
         sys.path.insert(0, "/opt/airflow")
-        from dags._utils import get_db_engine
-        import json
-        from sqlalchemy import text
+        from dags._utils import get_mlflow_client
 
-        engine = get_db_engine()
-        query = text("""
-            SELECT id, name, version, artifact_path, metrics, trained_on_days
-            FROM model_versions
-            WHERE stage = 'production' AND is_champion = true
-            ORDER BY trained_at DESC
-            LIMIT 1
-        """)
+        MODEL_NAME = "xgboost_price_predictor"
+        client = get_mlflow_client()
 
-        with engine.connect() as conn:
-            row = conn.execute(query).fetchone()
-
-        if not row:
+        try:
+            versions = client.get_latest_versions(MODEL_NAME, ["Production"])
+        except Exception:
             logger.info("No existe champion actual — primer entrenamiento")
             return {}
 
-        metrics = row.metrics if isinstance(row.metrics, dict) else json.loads(row.metrics)
-        logger.info("Champion actual: id=%s | version=%s | rmse=%.2f",
-                    row.id, row.version, metrics.get("rmse", 0))
+        if not versions:
+            logger.info("No existe champion actual — primer entrenamiento")
+            return {}
+
+        mv = versions[0]
+        tags = mv.tags or {}
+        metrics = {
+            k.removeprefix("metric."): float(v)
+            for k, v in tags.items()
+            if k.startswith("metric.")
+        }
+
+        logger.info("Champion actual: %s@%s | rmse=%.2f",
+                    MODEL_NAME, mv.version, metrics.get("rmse", 0))
         return {
-            "id": str(row.id),
-            "version": row.version,
-            "artifact_path": row.artifact_path,
+            "id": tags.get("domain_id", mv.version),
+            "version": mv.version,
+            "artifact_path": mv.source or f"models:/{MODEL_NAME}/{mv.version}",
             "metrics": metrics,
+            "mlflow_version": mv.version,
         }
 
     @task(task_id="get_challenger")
     def get_challenger() -> dict:
         """
-        Obtiene el challenger más reciente (stage='dev') para comparar.
+        Obtiene el challenger más reciente (MLflow stage='Staging').
         Falla si no hay challenger disponible.
         """
-        import sys
+        import sys, os
         sys.path.insert(0, "/opt/airflow")
-        from dags._utils import get_db_engine
-        import json
-        from sqlalchemy import text
+        from dags._utils import get_mlflow_client
 
-        engine = get_db_engine()
-        query = text("""
-            SELECT id, name, version, artifact_path, metrics, trained_on_days
-            FROM model_versions
-            WHERE stage = 'dev'
-            ORDER BY trained_at DESC
-            LIMIT 1
-        """)
+        MODEL_NAME = "xgboost_price_predictor"
+        client = get_mlflow_client()
 
-        with engine.connect() as conn:
-            row = conn.execute(query).fetchone()
+        try:
+            versions = client.get_latest_versions(MODEL_NAME, ["Staging"])
+        except Exception as exc:
+            raise ValueError(f"No hay challenger disponible en MLflow: {exc}") from exc
 
-        if not row:
-            raise ValueError("No hay challenger disponible para comparar")
+        if not versions:
+            raise ValueError("No hay challenger disponible en MLflow stage=Staging")
 
-        metrics = row.metrics if isinstance(row.metrics, dict) else json.loads(row.metrics)
-        logger.info("Challenger: id=%s | version=%s | rmse=%.2f",
-                    row.id, row.version, metrics.get("rmse", 0))
+        mv = versions[0]
+        tags = mv.tags or {}
+        metrics = {
+            k.removeprefix("metric."): float(v)
+            for k, v in tags.items()
+            if k.startswith("metric.")
+        }
+
+        logger.info("Challenger: %s@%s | rmse=%.2f",
+                    MODEL_NAME, mv.version, metrics.get("rmse", 0))
         return {
-            "id": str(row.id),
-            "version": row.version,
-            "artifact_path": row.artifact_path,
+            "id": tags.get("domain_id", mv.version),
+            "version": mv.version,
+            "artifact_path": mv.source or f"models:/{MODEL_NAME}/{mv.version}",
             "metrics": metrics,
-            "trained_on_days": row.trained_on_days,
+            "trained_on_days": int(tags.get("trained_on_days", 90)),
+            "mlflow_version": mv.version,
         }
 
     @task(task_id="compare_and_decide")
@@ -165,68 +170,63 @@ def model_promotion_dag():
     @task(task_id="execute_promotion")
     def execute_promotion(comparison_result: dict) -> dict:
         """
-        Ejecuta la promoción si la decisión es 'promote':
-          - champion anterior → stage='archived', is_champion=False
-          - challenger → stage='production', is_champion=True
+        Ejecuta la promoción en MLflow usando stage transitions:
+          - 'promote'       → challenger: Staging → Production, champion: Production → Archived
+          - 'keep_champion' → challenger: Staging → Archived (evaluado, rechazado)
         """
-        import sys
+        import sys, os
         sys.path.insert(0, "/opt/airflow")
-        from dags._utils import get_db_engine
-        from sqlalchemy import text
-        from datetime import datetime, timezone
+        from dags._utils import get_mlflow_client
 
+        MODEL_NAME = "xgboost_price_predictor"
         decision = comparison_result["decision"]
         champion = comparison_result["champion"]
         challenger = comparison_result["challenger"]
+        client = get_mlflow_client()
 
         if decision != "promote":
-            logger.info("Manteniendo champion actual — sin cambios en DB")
-            # Marcar challenger como 'staged' (evaluado pero no promovido)
-            engine = get_db_engine()
-            with engine.begin() as conn:
-                conn.execute(text("""
-                    UPDATE model_versions
-                    SET stage = 'staging'
-                    WHERE id = :id
-                """), {"id": challenger["id"]})
-            return {"action": "kept_champion", "challenger_stage": "staging"}
+            logger.info("Manteniendo champion — archivando challenger evaluado")
+            client.transition_model_version_stage(
+                name=MODEL_NAME,
+                version=challenger["mlflow_version"],
+                stage="Archived",
+            )
+            client.set_model_version_tag(
+                MODEL_NAME, challenger["mlflow_version"],
+                "promotion_result", "rejected",
+            )
+            return {"action": "kept_champion", "challenger_stage": "Archived"}
 
-        engine = get_db_engine()
-        with engine.begin() as conn:
-            # 1. Archivar champion actual
-            if champion:
-                conn.execute(text("""
-                    UPDATE model_versions
-                    SET stage = 'archived', is_champion = false
-                    WHERE id = :id
-                """), {"id": champion["id"]})
-                logger.info("Champion archivado: id=%s", champion["id"])
+        # 1. Archivar champion actual
+        if champion.get("mlflow_version"):
+            client.transition_model_version_stage(
+                name=MODEL_NAME,
+                version=champion["mlflow_version"],
+                stage="Archived",
+            )
+            logger.info("Champion archivado: %s@%s", MODEL_NAME, champion["mlflow_version"])
 
-            # 2. Archivar todos los demás 'dev' y 'staging' (limpiar)
-            conn.execute(text("""
-                UPDATE model_versions
-                SET stage = 'archived'
-                WHERE stage IN ('dev', 'staging') AND id != :challenger_id
-            """), {"challenger_id": challenger["id"]})
-
-            # 3. Promover challenger
-            conn.execute(text("""
-                UPDATE model_versions
-                SET stage = 'production',
-                    is_champion = true,
-                    promoted_at = :promoted_at
-                WHERE id = :id
-            """), {
-                "id": challenger["id"],
-                "promoted_at": datetime.now(timezone.utc),
-            })
-            logger.info("Challenger promovido a production: id=%s | version=%s",
-                        challenger["id"], challenger["version"])
+        # 2. Promover challenger a Production
+        client.transition_model_version_stage(
+            name=MODEL_NAME,
+            version=challenger["mlflow_version"],
+            stage="Production",
+        )
+        client.set_model_version_tag(
+            MODEL_NAME, challenger["mlflow_version"],
+            "promoted_by", "airflow_dag",
+        )
+        client.set_model_version_tag(
+            MODEL_NAME, challenger["mlflow_version"],
+            "promotion_result", "promoted",
+        )
+        logger.info("Challenger promovido a Production: %s@%s",
+                    MODEL_NAME, challenger["mlflow_version"])
 
         return {
             "action": "promoted",
             "new_champion_id": challenger["id"],
-            "new_champion_version": challenger["version"],
+            "new_champion_version": challenger["mlflow_version"],
             "reason": comparison_result["reason"],
         }
 

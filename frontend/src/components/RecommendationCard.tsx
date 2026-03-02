@@ -4,7 +4,7 @@ import { Card, CardBody, CardHeader, CardTitle } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { SkeletonCard } from '@/components/ui/Skeleton'
 import { useRecommendation, useGenerateRecommendation } from '@/hooks/useRecommendation'
-import { formatCOP, formatRelative, riskColor, riskLabel, cn } from '@/lib/utils'
+import { formatCOP, formatRelative, riskLabel, cn } from '@/lib/utils'
 import type { HourlyOffer } from '@/api/types'
 
 function RiskBadgeVariant(level: string) {

@@ -34,8 +34,6 @@ export const useAppStore = create<AppStore>()(
     }),
     {
       name: 'agente-energia-prefs',
-      partializeWhitelist: ['selectedAgent', 'viewMode'],
-      // Solo persistir agente y modo de vista
       partialize: (state) => ({
         selectedAgent: state.selectedAgent,
         viewMode: state.viewMode,

@@ -107,43 +107,50 @@ def llm_analysis_dag():
     @task(task_id="load_champion_and_predict")
     def load_champion_and_predict(market_context: dict) -> dict:
         """
-        Carga el modelo champion y genera predicciones 24h con intervalos.
+        Carga el modelo champion desde MLflow Model Registry y genera predicciones 24h.
+        El modelo se descarga desde MinIO (artifact store de MLflow).
         """
-        import sys
+        import sys, os, tempfile
         sys.path.insert(0, "/opt/airflow")
         sys.path.insert(0, "/opt/airflow/ml")
-        from dags._utils import get_db_engine, get_model_registry
-        from sqlalchemy import text
-        import json
+        from dags._utils import get_mlflow_client
 
         if not market_context:
             return {}
 
-        # Obtener artifact_path del champion
-        engine = get_db_engine()
-        query = text("""
-            SELECT artifact_path, metrics, version
-            FROM model_versions
-            WHERE stage = 'production' AND is_champion = true
-            ORDER BY trained_at DESC
-            LIMIT 1
-        """)
+        MODEL_NAME = "xgboost_price_predictor"
+        client = get_mlflow_client()
 
-        with engine.connect() as conn:
-            row = conn.execute(query).fetchone()
-
-        if not row:
-            logger.warning("Sin champion disponible — omitiendo predicción")
+        try:
+            versions = client.get_latest_versions(MODEL_NAME, ["Production"])
+        except Exception as exc:
+            logger.warning("Sin champion en MLflow: %s — omitiendo predicción", exc)
             return {}
 
-        artifact_path = row.artifact_path
-        model_metrics = row.metrics if isinstance(row.metrics, dict) else json.loads(row.metrics)
-        model_version = row.version
+        if not versions:
+            logger.warning("Sin champion disponible en MLflow — omitiendo predicción")
+            return {}
 
-        # Cargar modelo desde MinIO
+        mv = versions[0]
+        tags = mv.tags or {}
+        model_metrics = {
+            k.removeprefix("metric."): float(v)
+            for k, v in tags.items()
+            if k.startswith("metric.")
+        }
+        model_version = mv.version
+
+        # Descargar artefactos del modelo completo (3 cuantiles) desde MLflow/MinIO
+        import mlflow
+        tmpdir = tempfile.mkdtemp(prefix="champion_")
+        local_path = mlflow.artifacts.download_artifacts(
+            artifact_uri=f"models:/{MODEL_NAME}/{model_version}/full_model",
+            dst_path=tmpdir,
+        )
+
         from models.price_prediction.xgboost_model import XGBoostPriceModel
-        registry = get_model_registry()
-        model = registry.load_model(XGBoostPriceModel, artifact_path)
+        from pathlib import Path
+        model = XGBoostPriceModel.load(Path(local_path))
 
         # Construir features para las próximas 24 horas
         import pandas as pd
@@ -231,16 +238,35 @@ def llm_analysis_dag():
             logger.warning("Sin contexto o predicciones para %s", agent_sic_code)
             return {}
 
-        from openai import OpenAI
+        # Seleccionar proveedor LLM según LLM_PROVIDER
+        llm_provider = os.environ.get("LLM_PROVIDER", "deepseek").lower()
 
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        if not api_key:
-            raise ValueError("DEEPSEEK_API_KEY no configurado")
-
-        client = OpenAI(
-            api_key=api_key,
-            base_url="https://api.deepseek.com/v1",
-        )
+        if llm_provider == "ollama":
+            from langchain_ollama import ChatOllama
+            llm = ChatOllama(
+                model=os.environ.get("OLLAMA_MODEL", "llama3.2"),
+                base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+                format="json",
+                temperature=0.3,
+            )
+            llm_model_name = f"ollama:{os.environ.get('OLLAMA_MODEL', 'llama3.2')}"
+        else:
+            from langchain_openai import ChatOpenAI
+            api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+            if not api_key and llm_provider == "deepseek":
+                raise ValueError("DEEPSEEK_API_KEY no configurado")
+            base_url = (os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+                        if llm_provider == "deepseek" else None)
+            model_id = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+            llm = ChatOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                model=model_id,
+                temperature=0.3,
+                max_tokens=800,
+                model_kwargs={"response_format": {"type": "json_object"}},
+            )
+            llm_model_name = f"{llm_provider}:{model_id}"
 
         predictions = prediction_result["predictions"]
         avg_pred = sum(p["predicted_price"] for p in predictions) / len(predictions)
@@ -297,39 +323,36 @@ PREDICCIONES DEL MODELO (próximas 24 horas):
 
 ¿Cuál es la estrategia de oferta de precio óptima para este agente?"""
 
-        try:
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-                max_tokens=800,
-                response_format={"type": "json_object"},
-            )
+        from langchain_core.messages import HumanMessage, SystemMessage
 
-            content = response.choices[0].message.content
+        try:
+            response = llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt),
+            ])
+
+            content = response.content if hasattr(response, "content") else str(response)
             recommendation = json.loads(content)
             recommendation["agent_sic_code"] = agent_sic_code
             recommendation["model_version"] = prediction_result.get("model_version")
+            recommendation["llm_model_used"] = llm_model_name
             recommendation["predictions_summary"] = {
                 "avg_price": avg_pred,
                 "avg_peak_price": avg_peak,
                 "horizon_hours": len(predictions),
             }
 
-            logger.info("Recomendación generada para %s: %.2f COP/kWh | riesgo=%s",
-                        agent_sic_code,
+            logger.info("Recomendación generada para %s via %s: %.2f COP/kWh | riesgo=%s",
+                        agent_sic_code, llm_model_name,
                         recommendation.get("recommended_offer_price_cop", 0),
                         recommendation.get("risk_level", "?"))
             return recommendation
 
         except json.JSONDecodeError as e:
-            logger.error("Deepseek no retornó JSON válido: %s", e)
+            logger.error("LLM no retornó JSON válido para %s: %s", agent_sic_code, e)
             return {}
         except Exception as e:
-            logger.error("Error llamando Deepseek para %s: %s", agent_sic_code, e)
+            logger.error("Error llamando LLM (%s) para %s: %s", llm_model_name, agent_sic_code, e)
             raise
 
     @task(task_id="store_recommendations")
@@ -375,7 +398,7 @@ PREDICCIONES DEL MODELO (próximas 24 horas):
                     "rationale": rec.get("rationale", ""),
                     "key_factors": json.dumps(rec.get("key_factors", [])),
                     "hourly_offers": json.dumps(rec.get("hourly_strategy", {})),
-                    "llm_model": "deepseek-chat",
+                    "llm_model": rec.get("llm_model_used", "deepseek-chat"),
                     "created_at": now,
                     "valid_until": now.replace(
                         hour=now.hour + 1 if now.hour < 23 else 23,

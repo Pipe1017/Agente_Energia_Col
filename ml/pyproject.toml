@@ -16,6 +16,8 @@ dependencies = [
     "pydataxm>=0.5",
     "python-dotenv>=1.0",
     "tenacity>=8.2",      # retry con backoff para XM API
+    "mlflow>=2.13",       # tracking de experimentos y registro de modelos
+    "boto3>=1.34",        # boto3 necesario para MLflow con S3/MinIO
 ]
 
 [project.optional-dependencies]

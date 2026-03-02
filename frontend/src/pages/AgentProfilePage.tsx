@@ -27,7 +27,7 @@ export function AgentProfilePage() {
   const update = useMutation({
     mutationFn: () =>
       agentsApi.update(selectedAgent, {
-        risk_profile: riskProfile || agent?.risk_profile,
+        risk_profile: (riskProfile || agent?.risk_profile) as 'conservative' | 'moderate' | 'aggressive' | undefined,
         installed_capacity_mw: capacityMw ? parseFloat(capacityMw) : undefined,
         variable_cost_cop_kwh: costCopKwh ? parseFloat(costCopKwh) : undefined,
       }),

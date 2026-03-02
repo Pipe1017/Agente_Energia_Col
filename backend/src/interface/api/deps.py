@@ -20,7 +20,8 @@ from ...infrastructure.db.repositories.pg_market_repository import PgMarketRepos
 from ...infrastructure.db.repositories.pg_model_repository import PgModelRepository
 from ...infrastructure.db.repositories.pg_prediction_repository import PgPredictionRepository
 from ...infrastructure.db.repositories.pg_recommendation_repository import PgRecommendationRepository
-from ...infrastructure.external.deepseek_adapter import DeepseekAdapter
+from ...domain.services.i_llm_service import ILLMService
+from ...infrastructure.external.langchain_llm_adapter import LangChainLLMAdapter
 
 # ------------------------------------------------------------------
 # Alias tipados para inyección limpia en routers
@@ -59,17 +60,16 @@ def get_recommendation_repo(session: SessionDep) -> PgRecommendationRepository:
 # ------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
-def _get_deepseek_adapter() -> DeepseekAdapter:
-    """Singleton — el cliente HTTP se reutiliza entre requests."""
-    settings = get_settings()
-    return DeepseekAdapter(
-        api_key=settings.DEEPSEEK_API_KEY,
-        model=settings.DEEPSEEK_MODEL,
-    )
+def _get_llm_adapter() -> LangChainLLMAdapter:
+    """
+    Singleton — se instancia una sola vez.
+    El proveedor (Deepseek | Ollama | OpenAI) se determina por LLM_PROVIDER.
+    """
+    return LangChainLLMAdapter(get_settings())
 
 
-def get_llm_service() -> DeepseekAdapter:
-    return _get_deepseek_adapter()
+def get_llm_service() -> ILLMService:
+    return _get_llm_adapter()
 
 
 # ------------------------------------------------------------------
@@ -81,4 +81,4 @@ MarketRepoDep = Annotated[PgMarketRepository, Depends(get_market_repo)]
 ModelRepoDep = Annotated[PgModelRepository, Depends(get_model_repo)]
 PredictionRepoDep = Annotated[PgPredictionRepository, Depends(get_prediction_repo)]
 RecommendationRepoDep = Annotated[PgRecommendationRepository, Depends(get_recommendation_repo)]
-LLMServiceDep = Annotated[DeepseekAdapter, Depends(get_llm_service)]
+LLMServiceDep = Annotated[ILLMService, Depends(get_llm_service)]

@@ -18,12 +18,13 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
-    # Paquetes adicionales — reemplazar por Dockerfile custom en producción firme
-    _PIP_ADDITIONAL_REQUIREMENTS: "pydataxm>=0.5 minio boto3 pandas>=2.0 scikit-learn xgboost>=2.0 httpx"
     # Variables del proyecto disponibles en todos los DAGs
     DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
     DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
     DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+    LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
+    OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
     MINIO_ENDPOINT: minio:9000
     MINIO_ROOT_USER: ${MINIO_ROOT_USER}
     MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
@@ -32,6 +33,12 @@ x-airflow-common: &airflow-common
     POSTGRES_USER: ${POSTGRES_USER}
     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     POSTGRES_DB: ${POSTGRES_DB}
+    # MLflow tracking
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    _PIP_ADDITIONAL_REQUIREMENTS: "pydataxm>=0.5 minio boto3 pandas>=2.0 scikit-learn xgboost>=2.0 httpx mlflow>=2.13 langchain>=0.3 langchain-openai>=0.2 langchain-ollama>=0.2 langchain-core>=0.3"
   volumes:
     - ../orchestration/dags:/opt/airflow/dags:ro
     - ../orchestration/plugins:/opt/airflow/plugins:ro
@@ -126,6 +133,38 @@ services:
     restart: "no"
 
   # ============================================================
+  # MLflow — tracking server con PostgreSQL backend + MinIO artifacts
+  # ============================================================
+
+  mlflow:
+    build:
+      context: ./docker/mlflow
+      dockerfile: Dockerfile
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+        --default-artifact-root s3://mlflow/
+        --serve-artifacts
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - backend-net
+    restart: unless-stopped
+
+  # ============================================================
   # Airflow
   # ============================================================
 
@@ -215,6 +254,10 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "${API_PORT:-8000}:8000"
@@ -225,6 +268,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      mlflow:
+        condition: service_started
     networks:
       - backend-net
       - frontend-net

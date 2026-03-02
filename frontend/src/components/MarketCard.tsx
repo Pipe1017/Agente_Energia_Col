@@ -1,4 +1,4 @@
-import { Droplets, TrendingUp, TrendingDown, Minus, Zap, Activity } from 'lucide-react'
+import { Droplets, TrendingUp, TrendingDown, Minus } from 'lucide-react'
 import { Card, CardBody, CardHeader, CardTitle } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { SkeletonCard } from '@/components/ui/Skeleton'

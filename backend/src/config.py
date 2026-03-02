@@ -66,13 +66,28 @@ class Settings(BaseSettings):
     MINIO_BUCKET_REPORTS: str = "reports"
 
     # ------------------------------------------------------------------
-    # Deepseek LLM
+    # LLM — proveedor configurable via LLM_PROVIDER
     # ------------------------------------------------------------------
+    # Proveedor: "deepseek" (prod) | "ollama" (dev local) | "openai"
+    LLM_PROVIDER: str = "deepseek"
+
+    # Deepseek (compatible con protocolo OpenAI)
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
     DEEPSEEK_MODEL: str = "deepseek-chat"
     DEEPSEEK_MAX_TOKENS: int = 2048
     DEEPSEEK_TEMPERATURE: float = 0.3
+
+    # Ollama (desarrollo local — sin API key)
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "llama3.2"
+
+    # ------------------------------------------------------------------
+    # MLflow
+    # ------------------------------------------------------------------
+    MLFLOW_TRACKING_URI: str = "http://localhost:5000"
+    MLFLOW_EXPERIMENT_NAME: str = "price_prediction_24h"
+    MLFLOW_REGISTERED_MODEL_NAME: str = "xgboost_price_predictor"
 
     # ------------------------------------------------------------------
     # Aplicación

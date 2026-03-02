@@ -1,6 +1,6 @@
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
-  ReferenceLine, ResponsiveContainer, Legend,
+  ReferenceLine, ResponsiveContainer,
 } from 'recharts'
 import { Card, CardBody, CardHeader, CardTitle } from '@/components/ui/Card'
 import { SkeletonCard } from '@/components/ui/Skeleton'

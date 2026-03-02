@@ -21,7 +21,7 @@ function StageBadge({ stage }: { stage: string }) {
   )
 }
 
-function MetricCell({ label, value }: { label: string; value: number | null }) {
+function MetricCell({ value }: { value: number | null }) {
   if (value == null) return <td className="px-4 py-3 text-zinc-600">—</td>
   return (
     <td className="px-4 py-3 font-mono text-sm text-zinc-300">
@@ -40,9 +40,9 @@ function VersionRow({ model }: { model: ModelVersion }) {
         </div>
       </td>
       <td className="px-4 py-3"><StageBadge stage={model.stage} /></td>
-      <MetricCell label="RMSE" value={model.metrics.rmse} />
-      <MetricCell label="MAPE" value={model.metrics.mape} />
-      <MetricCell label="R²"   value={model.metrics.r2}   />
+      <MetricCell value={model.metrics.rmse} />
+      <MetricCell value={model.metrics.mape} />
+      <MetricCell value={model.metrics.r2}   />
       <td className="px-4 py-3 text-xs text-zinc-500">
         {model.trained_on_days}d
       </td>
@@ -57,7 +57,7 @@ export function ModelsPage() {
   const { data: status } = useModelStatus()
   const { data: versions } = useQuery({
     queryKey: ['models', 'versions'],
-    queryFn: modelsApi.versions,
+    queryFn: () => modelsApi.versions(),
     staleTime: 10 * 60 * 1000,
   })
 

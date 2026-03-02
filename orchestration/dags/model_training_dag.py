@@ -178,73 +178,104 @@ def model_training_dag():
     @task(task_id="save_to_registry")
     def save_to_registry(eval_result: dict) -> dict:
         """
-        Guarda el modelo challenger en MinIO y registra metadata en PostgreSQL.
-        El modelo queda en stage='dev' hasta que model_promotion_dag lo promueva.
+        Registra el modelo challenger en MLflow (tracking + Model Registry).
+        MLflow usa MinIO como artifact store (S3-compatible).
+        El modelo queda en stage 'Staging' hasta que model_promotion_dag lo promueva.
         """
-        import sys, json, uuid
+        import sys, os, uuid, shutil
         sys.path.insert(0, "/opt/airflow")
-        from dags._utils import get_db_engine, get_model_registry
-        from datetime import datetime, timezone
+        sys.path.insert(0, "/opt/airflow/ml")
+
+        from dags._utils import get_or_create_mlflow_experiment
         from pathlib import Path
+        from datetime import datetime, timezone
+
+        import mlflow
+        import mlflow.xgboost
+        from mlflow.tracking import MlflowClient
 
         model_dir = eval_result["model_dir"]
         metrics = eval_result["metrics"]
         trained_on_days = eval_result["trained_on_days"]
+        train_rows = eval_result.get("train_rows", 0)
 
-        # Cargar clase del modelo
-        sys.path.insert(0, "/opt/airflow/ml")
+        MODEL_NAME = "xgboost_price_predictor"
+        EXPERIMENT = "price_prediction_24h"
+        TASK = "price_prediction_24h"
+
+        # Configurar MLflow + MinIO
+        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+        os.environ.setdefault("MLFLOW_S3_ENDPOINT_URL",
+                              f"http://{os.environ.get('MINIO_ENDPOINT', 'minio:9000')}")
+        os.environ.setdefault("AWS_ACCESS_KEY_ID", os.environ.get("MINIO_ROOT_USER", ""))
+        os.environ.setdefault("AWS_SECRET_ACCESS_KEY", os.environ.get("MINIO_ROOT_PASSWORD", ""))
+
+        mlflow.set_tracking_uri(tracking_uri)
+        experiment_id = get_or_create_mlflow_experiment(EXPERIMENT)
+        domain_id = str(uuid.uuid4())
+
         from models.price_prediction.xgboost_model import XGBoostPriceModel
-
         model = XGBoostPriceModel.load(Path(model_dir))
 
-        registry = get_model_registry()
-        artifact_path = registry.save_model(
-            model=model,
-            metrics=metrics,
-            params={"train_lookback_days": trained_on_days, "val_days": VAL_DAYS},
-            trained_on_days=trained_on_days,
-        )
-
-        # Registrar en PostgreSQL como 'dev' (challenger)
-        version_id = str(uuid.uuid4())
-        version_name = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        engine = get_db_engine()
-
-        from sqlalchemy import text
-        with engine.begin() as conn:
-            conn.execute(text("""
-                INSERT INTO model_versions
-                    (id, name, task, algorithm, version, stage,
-                     artifact_path, metrics, params,
-                     trained_on_days, trained_at, is_champion)
-                VALUES
-                    (:id, :name, :task, :algo, :version, 'dev',
-                     :artifact_path, :metrics::jsonb, :params::jsonb,
-                     :trained_on_days, :trained_at, false)
-            """), {
-                "id": version_id,
-                "name": "xgboost",
-                "task": "price_prediction_24h",
-                "algo": "XGBoostPriceModel",
-                "version": version_name,
-                "artifact_path": artifact_path,
-                "metrics": json.dumps(metrics),
-                "params": json.dumps({"train_lookback_days": trained_on_days, "val_days": VAL_DAYS}),
-                "trained_on_days": trained_on_days,
-                "trained_at": datetime.now(timezone.utc),
+        with mlflow.start_run(experiment_id=experiment_id) as run:
+            # Loguear parámetros
+            mlflow.log_params({
+                "train_lookback_days": trained_on_days,
+                "val_days": VAL_DAYS,
+                "train_rows": train_rows,
+                "algorithm": "XGBoostPriceModel",
+                "task": TASK,
             })
 
-        logger.info("Challenger registrado: id=%s | version=%s | rmse=%.2f",
-                    version_id, version_name, metrics.get("rmse", 0))
+            # Loguear métricas
+            mlflow.log_metrics({k: float(v) for k, v in metrics.items()})
 
-        # Limpiar directorio temporal
-        import shutil
+            # Loguear el modelo cuantil median (q=0.5) como artefacto MLflow
+            # Los 3 modelos cuantiles se guardan como artefacto adicional
+            mlflow.xgboost.log_model(
+                model._models[0.5],
+                artifact_path="model",
+                registered_model_name=MODEL_NAME,
+            )
+
+            # Guardar también el modelo completo (3 cuantiles) como artefacto raw
+            mlflow.log_artifacts(model_dir, artifact_path="full_model")
+
+            run_id = run.info.run_id
+            artifact_uri = f"runs:/{run_id}/full_model"
+
+        # Obtener la versión recién registrada y moverla a "Staging"
+        client = MlflowClient(tracking_uri=tracking_uri)
+        latest = client.get_latest_versions(MODEL_NAME, ["None"])
+        registered_version = latest[0].version if latest else "1"
+
+        client.transition_model_version_stage(
+            name=MODEL_NAME,
+            version=registered_version,
+            stage="Staging",
+        )
+
+        # Tags para rastreo cruzado con dominio
+        for key, val in {
+            "domain_id": domain_id,
+            "task": TASK,
+            "trained_on_days": str(trained_on_days),
+            **{f"metric.{k}": str(v) for k, v in metrics.items()},
+            **{"param.train_lookback_days": str(trained_on_days),
+               "param.val_days": str(VAL_DAYS)},
+        }.items():
+            client.set_model_version_tag(MODEL_NAME, registered_version, key, val)
+
+        logger.info("Challenger registrado en MLflow: %s@%s | run_id=%s | rmse=%.2f",
+                    MODEL_NAME, registered_version, run_id, metrics.get("rmse", 0))
+
         shutil.rmtree(model_dir, ignore_errors=True)
 
         return {
-            "version_id": version_id,
-            "version_name": version_name,
-            "artifact_path": artifact_path,
+            "version_id": domain_id,
+            "version_name": registered_version,
+            "artifact_path": artifact_uri,
+            "mlflow_run_id": run_id,
             "metrics": metrics,
         }
 

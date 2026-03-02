@@ -1,4 +1,4 @@
-import { Brain, CheckCircle, AlertCircle } from 'lucide-react'
+import { Brain, AlertCircle } from 'lucide-react'
 import { useModelStatus } from '@/hooks/useAgents'
 import { Badge } from '@/components/ui/Badge'
 import { formatRelative } from '@/lib/utils'
