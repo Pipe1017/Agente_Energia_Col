@@ -17,9 +17,9 @@ from ...config import get_settings, Settings
 from ...infrastructure.db.session import get_session
 from ...infrastructure.db.repositories.pg_agent_repository import PgAgentRepository
 from ...infrastructure.db.repositories.pg_market_repository import PgMarketRepository
-from ...infrastructure.db.repositories.pg_model_repository import PgModelRepository
 from ...infrastructure.db.repositories.pg_prediction_repository import PgPredictionRepository
 from ...infrastructure.db.repositories.pg_recommendation_repository import PgRecommendationRepository
+from ...infrastructure.mlflow.mlflow_model_repository import MlflowModelRepository
 from ...domain.services.i_llm_service import ILLMService
 from ...infrastructure.external.langchain_llm_adapter import LangChainLLMAdapter
 
@@ -43,8 +43,17 @@ def get_market_repo(session: SessionDep) -> PgMarketRepository:
     return PgMarketRepository(session)
 
 
-def get_model_repo(session: SessionDep) -> PgModelRepository:
-    return PgModelRepository(session)
+@lru_cache(maxsize=1)
+def _get_mlflow_model_repo() -> MlflowModelRepository:
+    settings = get_settings()
+    return MlflowModelRepository(
+        tracking_uri=settings.MLFLOW_TRACKING_URI,
+        registered_model_name="xgboost_price_predictor",
+    )
+
+
+def get_model_repo() -> MlflowModelRepository:
+    return _get_mlflow_model_repo()
 
 
 def get_prediction_repo(session: SessionDep) -> PgPredictionRepository:
@@ -78,7 +87,7 @@ def get_llm_service() -> ILLMService:
 
 AgentRepoDep = Annotated[PgAgentRepository, Depends(get_agent_repo)]
 MarketRepoDep = Annotated[PgMarketRepository, Depends(get_market_repo)]
-ModelRepoDep = Annotated[PgModelRepository, Depends(get_model_repo)]
+ModelRepoDep = Annotated[MlflowModelRepository, Depends(get_model_repo)]
 PredictionRepoDep = Annotated[PgPredictionRepository, Depends(get_prediction_repo)]
 RecommendationRepoDep = Annotated[PgRecommendationRepository, Depends(get_recommendation_repo)]
 LLMServiceDep = Annotated[ILLMService, Depends(get_llm_service)]

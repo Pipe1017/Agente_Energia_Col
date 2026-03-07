@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import DateTime, Float, Index, String, Text
@@ -21,23 +21,24 @@ class RecommendationModel(Base):
     prediction_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     model_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
-    recommended_offer_price_cop: Mapped[float] = mapped_column(Float, nullable=False)
-    confidence: Mapped[str] = mapped_column(String(10), nullable=False, default="media")
     risk_level: Mapped[str] = mapped_column(String(10), nullable=False)
-    rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    narrative: Mapped[str] = mapped_column(Text, nullable=False, default="")
     key_factors: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
-    hourly_offers: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    hourly_offers: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
     llm_model_used: Mapped[str] = mapped_column(String(100), nullable=False, default="deepseek-chat")
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
 
     __table_args__ = (
-        Index("ix_recommendations_agent_ts", "agent_sic_code", "created_at"),
+        Index("ix_recommendations_agent_ts", "agent_sic_code", "generated_at"),
     )
 
     def __repr__(self) -> str:
         return (
             f"<RecommendationModel agent={self.agent_sic_code} "
-            f"price={self.recommended_offer_price_cop:.2f} at={self.created_at}>"
+            f"risk={self.risk_level} at={self.generated_at}>"
         )

@@ -18,8 +18,8 @@ export function useGenerateRecommendation() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: (contextHours = 72) =>
-      recommendationsApi.generate(agent, contextHours),
+    mutationFn: (contextHours?: number) =>
+      recommendationsApi.generate(agent, contextHours ?? 72),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['recommendation', 'latest', agent] })
     },

@@ -31,6 +31,13 @@ class MarketSnapshot:
     # Despacho
     thermal_dispatch_pct: float     # % de generación que es térmica
 
+    # Generación por tecnología (GWh/día — fuente SIMEM)
+    precio_escasez_cop: float | None = None
+    gen_hidraulica_gwh: float | None = None
+    gen_termica_gwh: float | None = None
+    gen_solar_gwh: float | None = None
+    gen_eolica_gwh: float | None = None
+
     # Contexto de agente (None = datos del sistema completo)
     agent_sic_code: str | None = None
 

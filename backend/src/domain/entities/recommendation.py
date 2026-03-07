@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import Optional
 from uuid import UUID
 
 
@@ -41,7 +42,7 @@ class Recommendation:
     id: UUID
     agent_sic_code: str
     generated_at: datetime
-    prediction_id: UUID
+    prediction_id: Optional[UUID]
 
     # Salida del LLM
     narrative: str               # análisis narrativo completo

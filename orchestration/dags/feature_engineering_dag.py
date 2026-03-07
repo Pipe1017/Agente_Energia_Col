@@ -7,7 +7,12 @@ con la misma lógica de ml/features/feature_pipeline.py y la persiste en:
   - PostgreSQL: tabla features_cache (reemplaza por rango de fechas)
   - MinIO:      features/{year}/{month}/{day}/features.parquet
 
-El DAG es idempotente: siempre re-genera los últimos 7 días.
+El DAG es idempotente: siempre re-genera los últimos 7 días de features.
+
+Lookback de market_data: 400 días (suficiente para calcular correctamente
+las ventanas largas de 30d y 90d de hidrología y el percentil anual de precio).
+La salida a features_cache solo contiene los últimos 7 días para no re-procesar
+historial innecesariamente (el historial antiguo ya fue computado antes).
 """
 from __future__ import annotations
 
@@ -27,6 +32,14 @@ DEFAULT_ARGS = {
     "max_retry_delay": timedelta(minutes=30),
 }
 
+# Cuánto historial necesitamos para computar correctamente las ventanas largas
+# price_percentile_365d → 365d, hydrology_rolling_mean_90d → 90d
+# + 7d buffer de salida = 400d total
+FEATURE_LOOKBACK_DAYS = 400
+
+# Solo persiste features de los últimos N días (el resto ya estaba en cache)
+OUTPUT_DAYS = 7
+
 
 @dag(
     dag_id="feature_engineering",
@@ -39,28 +52,43 @@ DEFAULT_ARGS = {
 )
 def feature_engineering_dag():
 
-    @task(task_id="load_market_data")
-    def load_market_data() -> dict:
+    @task(task_id="compute_features")
+    def compute_features() -> dict:
         """
-        Carga market_data de PostgreSQL para los últimos 7 días + buffer
-        para que los lags (168h) estén disponibles.
+        Carga market_data de los últimos FEATURE_LOOKBACK_DAYS días,
+        construye features (incluyendo ventanas largas de hidrología y
+        percentiles de precio), y retorna solo los últimos OUTPUT_DAYS
+        para persistir en features_cache.
+
+        La carga de market_data se hace internamente (no via XCom) para
+        evitar serializar cientos de MB entre tasks.
         """
         import sys
         sys.path.insert(0, "/opt/airflow")
-        from dags._utils import get_db_engine, fetch_date_range
-        from datetime import timedelta
-
-        start, end = fetch_date_range(lookback_days=14)  # 14d para lags 168h
-        logger.info("Cargando market_data %s → %s", start, end)
+        sys.path.insert(0, "/opt/airflow/ml")
+        from dags._utils import get_db_engine
+        from datetime import date, timedelta
 
         import pandas as pd
         from sqlalchemy import text
+        from features.feature_pipeline import build_feature_matrix
+
+        end_date = date.today()
+        start_date = end_date - timedelta(days=FEATURE_LOOKBACK_DAYS)
+        output_cutoff = end_date - timedelta(days=OUTPUT_DAYS)
+
+        logger.info(
+            "Cargando market_data %s → %s (lookback=%d días)",
+            start_date, end_date, FEATURE_LOOKBACK_DAYS,
+        )
 
         engine = get_db_engine()
         query = text("""
             SELECT
                 timestamp, spot_price_cop, demand_mwh,
-                hydrology_pct, reservoir_level_pct, thermal_dispatch_pct
+                hydrology_pct, reservoir_level_pct, thermal_dispatch_pct,
+                precio_escasez_cop, gen_hidraulica_gwh, gen_termica_gwh,
+                gen_solar_gwh, gen_eolica_gwh
             FROM market_data
             WHERE timestamp >= :start AND timestamp <= :end
               AND agent_sic_code IS NULL
@@ -68,51 +96,49 @@ def feature_engineering_dag():
         """)
 
         with engine.connect() as conn:
-            df = pd.read_sql(query, conn, params={"start": str(start), "end": str(end)})
+            result = conn.execute(query, {"start": str(start_date), "end": str(end_date)})
+            df = pd.DataFrame(result.fetchall(), columns=list(result.keys()))
 
         if df.empty:
-            logger.warning("No hay datos en market_data para el rango %s → %s", start, end)
+            logger.warning(
+                "No hay datos en market_data para %s → %s", start_date, end_date
+            )
             return {"rows": 0}
 
         logger.info("market_data cargados: %d filas", len(df))
-        # Serializar para XCom (JSON)
-        df["timestamp"] = df["timestamp"].astype(str)
-        return {"data": df.to_dict(orient="records"), "rows": len(df)}
-
-    @task(task_id="build_features")
-    def build_features(market_payload: dict) -> dict:
-        """
-        Construye la feature matrix completa usando feature_pipeline.py.
-        Retorna solo los últimos 7 días (sin el buffer de lags).
-        """
-        import sys
-        sys.path.insert(0, "/opt/airflow")
-        sys.path.insert(0, "/opt/airflow/ml")
-
-        if not market_payload.get("data"):
-            logger.warning("Sin datos de mercado — omitiendo build_features")
-            return {"rows": 0}
-
-        import pandas as pd
-        from features.feature_pipeline import build_feature_matrix
-
-        df = pd.DataFrame(market_payload["data"])
         df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-        logger.info("Construyendo features para %d filas...", len(df))
+        # Construir features (incluye validate_and_clean internamente)
         feature_df = build_feature_matrix(df, drop_na=True)
 
         if feature_df.empty:
-            logger.warning("build_feature_matrix retornó vacío")
+            logger.warning(
+                "build_feature_matrix retornó vacío — posiblemente datos "
+                "insuficientes para los lags de 168h"
+            )
             return {"rows": 0}
 
-        # Mantener solo últimos 7 días (no el buffer de lags)
-        cutoff = feature_df["timestamp"].max() - pd.Timedelta(days=7)
-        feature_df = feature_df[feature_df["timestamp"] >= cutoff].copy()
+        logger.info(
+            "Features construidas: %d filas × %d columnas", *feature_df.shape
+        )
 
-        logger.info("Features construidas: %d filas, %d columnas", *feature_df.shape)
-        feature_df["timestamp"] = feature_df["timestamp"].astype(str)
-        return {"data": feature_df.to_dict(orient="records"), "rows": len(feature_df)}
+        # Filtrar a solo los últimos OUTPUT_DAYS (no re-procesar historial)
+        output_df = feature_df[
+            feature_df["timestamp"] >= pd.Timestamp(output_cutoff, tz="UTC")
+        ].copy()
+
+        # Si no hay filas con tz-aware, intentar sin tz
+        if output_df.empty:
+            output_df = feature_df[
+                feature_df["timestamp"].dt.date >= output_cutoff
+            ].copy()
+
+        logger.info(
+            "Últimos %d días: %d filas para persistir", OUTPUT_DAYS, len(output_df)
+        )
+
+        output_df["timestamp"] = output_df["timestamp"].astype(str)
+        return {"data": output_df.to_dict(orient="records"), "rows": len(output_df)}
 
     @task(task_id="store_features_db")
     def store_features_db(feature_payload: dict) -> int:
@@ -122,11 +148,15 @@ def feature_engineering_dag():
         """
         import sys
         sys.path.insert(0, "/opt/airflow")
+        sys.path.insert(0, "/opt/airflow/ml")
         from dags._utils import get_db_engine
 
         if not feature_payload.get("data"):
+            logger.info("Sin features nuevas para persistir en BD")
             return 0
 
+        import json
+        import uuid
         import pandas as pd
         from sqlalchemy import text
 
@@ -136,24 +166,35 @@ def feature_engineering_dag():
         engine = get_db_engine()
         rows = df.to_dict(orient="records")
 
-        # Columnas de features numéricas (excluir timestamp y target)
+        # Columnas de features (excluir timestamp y target)
         numeric_cols = [c for c in df.columns if c not in ("timestamp", "spot_price_cop")]
 
         with engine.begin() as conn:
             for row in rows:
                 ts = row["timestamp"]
-                features_json = {k: row[k] for k in numeric_cols if k in row}
+                features_json = {
+                    k: (None if (v is None or (isinstance(v, float) and v != v)) else float(v))
+                    for k, v in row.items()
+                    if k not in ("timestamp", "spot_price_cop")
+                }
                 target = row.get("spot_price_cop")
+                if target is not None:
+                    target = float(target)
 
                 conn.execute(text("""
-                    INSERT INTO features_cache (timestamp, features_json, target_price)
-                    VALUES (:ts, :features::jsonb, :target)
+                    INSERT INTO features_cache (id, timestamp, features_json, target_price)
+                    VALUES (:id, :ts, CAST(:features AS json), :target)
                     ON CONFLICT (timestamp)
                     DO UPDATE SET
                         features_json = EXCLUDED.features_json,
                         target_price  = EXCLUDED.target_price,
                         updated_at    = NOW()
-                """), {"ts": ts, "features": __import__("json").dumps(features_json), "target": target})
+                """), {
+                    "id": str(uuid.uuid4()),
+                    "ts": ts,
+                    "features": json.dumps(features_json),
+                    "target": target,
+                })
 
         logger.info("features_cache actualizado: %d filas", len(rows))
         return len(rows)
@@ -161,7 +202,7 @@ def feature_engineering_dag():
     @task(task_id="store_features_minio")
     def store_features_minio(feature_payload: dict) -> str:
         """
-        Persiste features en MinIO como parquet para reproducibilidad de entrenamientos.
+        Persiste features en MinIO como parquet para reproducibilidad.
         Ruta: features/{year}/{month}/{day}/features.parquet
         """
         import sys, tempfile
@@ -178,9 +219,7 @@ def feature_engineering_dag():
         df["timestamp"] = pd.to_datetime(df["timestamp"])
 
         now = datetime.now(timezone.utc)
-        object_name = (
-            f"{now.year}/{now.month:02d}/{now.day:02d}/features.parquet"
-        )
+        object_name = f"{now.year}/{now.month:02d}/{now.day:02d}/features.parquet"
 
         with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
             df.to_parquet(tmp.name, index=False)
@@ -195,9 +234,7 @@ def feature_engineering_dag():
     # ------------------------------------------------------------------
     # Grafo de dependencias
     # ------------------------------------------------------------------
-    market_payload = load_market_data()
-    feature_payload = build_features(market_payload)
-
+    feature_payload = compute_features()
     store_features_db(feature_payload)
     store_features_minio(feature_payload)
 

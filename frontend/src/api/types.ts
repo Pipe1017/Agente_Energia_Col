@@ -40,6 +40,11 @@ export interface MarketSnapshot {
   reservoir_level_pct: number
   thermal_dispatch_pct: number
   agent_sic_code: string | null
+  precio_escasez_cop: number | null
+  gen_hidraulica_gwh: number | null
+  gen_termica_gwh: number | null
+  gen_solar_gwh: number | null
+  gen_eolica_gwh: number | null
   hydrology_status: 'crítica' | 'baja' | 'normal' | 'alta'
   is_hydrology_critical: boolean
   is_reservoir_low: boolean

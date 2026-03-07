@@ -1,5 +1,6 @@
 import { Outlet, NavLink } from 'react-router-dom'
 import { Header } from './Header'
+import { ChatPanel } from '@/components/ChatPanel'
 import { LayoutDashboard, User, Brain } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -46,6 +47,7 @@ export function AppLayout() {
       <main className="container mx-auto max-w-7xl px-4 py-6">
         <Outlet />
       </main>
+      <ChatPanel />
     </div>
   )
 }

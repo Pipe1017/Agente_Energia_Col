@@ -33,3 +33,27 @@ export function useMarketSummary(hours = 24) {
     staleTime: 4 * 60 * 1000,
   })
 }
+
+/** Historial SIN (sin agente) — para gráficas de precio, generación e hidrología.
+ *  Los datos del mercado eléctrico colombiano son sistema-wide, no por agente. */
+export function useMarketSINHistory(hours: number) {
+  return useQuery({
+    queryKey: ['market', 'sin-history', hours],
+    queryFn: () => marketApi.lastNHours(hours),   // sin agente → datos SIN
+    staleTime: 10 * 60 * 1000,
+    refetchInterval: false,
+  })
+}
+
+/** Historial completo por rango de fechas (datos crudos de BD). */
+export function useMarketDateRange(start: string, end: string) {
+  return useQuery({
+    queryKey: ['market', 'daterange', start, end],
+    queryFn: async () => {
+      const res = await marketApi.history(start, end)
+      return res.snapshots
+    },
+    staleTime: 10 * 60 * 1000,
+    refetchInterval: false,
+  })
+}

@@ -24,6 +24,11 @@ export const marketApi = {
     api.get<MarketSnapshot[]>(`/market/last/${hours}h${agent ? `?agent=${agent}` : ''}`),
   summary: (hours = 24, agent?: string) =>
     api.get<MarketSummary>(`/market/summary?hours=${hours}${agent ? `&agent=${agent}` : ''}`),
+  history: (start: string, end: string, agent?: string) => {
+    const q = new URLSearchParams({ start, end })
+    if (agent) q.set('agent', agent)
+    return api.get<{ count: number; snapshots: MarketSnapshot[] }>(`/market/history?${q}`)
+  },
 }
 
 // ---- Predictions ----
@@ -45,6 +50,16 @@ export const modelsApi = {
   champion: () => api.get<ModelStatus>('/models/champion'),
   versions: (stage?: string) =>
     api.get<ModelVersion[]>(`/models/versions${stage ? `?stage=${stage}` : ''}`),
+}
+
+// ---- Chat ----
+export const chatApi = {
+  message: (message: string, agent_sic_code: string, history: { role: string; content: string }[]) =>
+    api.post<{ response: string; model_used: string }>('/chat/message', {
+      message,
+      agent_sic_code,
+      history,
+    }),
 }
 
 // ---- Health ----

@@ -13,7 +13,7 @@ dependencies = [
     "xgboost>=2.0",       # reg:quantileerror requiere >= 1.7, ARM nativo >= 2.0
     "joblib>=1.3",
     "minio>=7.2",
-    "pydataxm>=0.5",
+    "pydataxm>=0.3",
     "python-dotenv>=1.0",
     "tenacity>=8.2",      # retry con backoff para XM API
     "mlflow>=2.13",       # tracking de experimentos y registro de modelos

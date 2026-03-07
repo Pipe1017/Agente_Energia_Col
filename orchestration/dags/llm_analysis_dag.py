@@ -30,9 +30,7 @@ DEFAULT_ARGS = {
     "retry_delay": timedelta(minutes=5),
 }
 
-# Agentes activos para generación de recomendaciones
-# En producción esto vendría de la BD, aquí usamos lista estática configurable
-ACTIVE_AGENTS = ["EPMC", "CLSI", "EMGS"]   # EPM, Celsia, Emgesa
+# Agentes activos: se leen dinámicamente de la BD en load_market_context
 
 
 @dag(
@@ -70,7 +68,8 @@ def llm_analysis_dag():
         """)
 
         with engine.connect() as conn:
-            df = pd.read_sql(query, conn)
+            result = conn.execute(query)
+            df = pd.DataFrame(result.fetchall(), columns=list(result.keys()))
 
         if df.empty:
             logger.warning("Sin datos de mercado recientes")
@@ -100,20 +99,28 @@ def llm_analysis_dag():
             ).to_dict(orient="records"),
         }
 
-        logger.info("Contexto de mercado cargado: precio=%.2f COP | hidro=%.1f%%",
-                    context["spot_price_cop"], context["hydrology_pct"])
+        # Leer agentes activos desde la BD (evitar lista hardcodeada)
+        with engine.connect() as conn:
+            agent_rows = conn.execute(text("SELECT sic_code FROM agents ORDER BY sic_code")).fetchall()
+        context["active_agents"] = [r[0] for r in agent_rows] or ["EPMC"]
+
+        logger.info("Contexto de mercado cargado: precio=%.2f COP | hidro=%.1f%% | agentes=%s",
+                    context["spot_price_cop"], context["hydrology_pct"], context["active_agents"])
         return context
 
     @task(task_id="load_champion_and_predict")
     def load_champion_and_predict(market_context: dict) -> dict:
         """
-        Carga el modelo champion desde MLflow Model Registry y genera predicciones 24h.
-        El modelo se descarga desde MinIO (artifact store de MLflow).
+        Carga el modelo champion desde MLflow y genera predicciones 24h.
+        Lee 200h de historial real desde market_data para calcular lag features
+        correctamente (lag_24h, lag_168h, rolling windows).
+        Persiste las predicciones en la tabla predictions por cada agente activo.
         """
-        import sys, os, tempfile
+        import sys, os, tempfile, uuid, json
         sys.path.insert(0, "/opt/airflow")
         sys.path.insert(0, "/opt/airflow/ml")
-        from dags._utils import get_mlflow_client
+        from dags._utils import get_mlflow_client, get_db_engine
+        from sqlalchemy import text
 
         if not market_context:
             return {}
@@ -139,59 +146,76 @@ def llm_analysis_dag():
             if k.startswith("metric.")
         }
         model_version = mv.version
+        # UUID de dominio del modelo (guardado como tag en save_to_registry)
+        domain_model_id = tags.get("domain_id", str(uuid.uuid4()))
 
-        # Descargar artefactos del modelo completo (3 cuantiles) desde MLflow/MinIO
         import mlflow
         tmpdir = tempfile.mkdtemp(prefix="champion_")
+        run_id = mv.run_id
         local_path = mlflow.artifacts.download_artifacts(
-            artifact_uri=f"models:/{MODEL_NAME}/{model_version}/full_model",
+            artifact_uri=f"runs:/{run_id}/full_model",
             dst_path=tmpdir,
         )
 
         from models.price_prediction.xgboost_model import XGBoostPriceModel
         from pathlib import Path
-        model = XGBoostPriceModel.load(Path(local_path))
-
-        # Construir features para las próximas 24 horas
         import pandas as pd
         import numpy as np
         from datetime import datetime, timezone, timedelta
         from features.feature_pipeline import build_feature_matrix, PRICE_PREDICTION_FEATURES
 
-        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        future_timestamps = [now + timedelta(hours=h) for h in range(1, 25)]
+        model = XGBoostPriceModel.load(Path(local_path))
 
-        # Construir DataFrame sintético para predicción futura
-        # Usando últimos valores de mercado como base
-        history = pd.DataFrame(market_context.get("history", []))
-        history["timestamp"] = pd.to_datetime(history["timestamp"])
+        # --- Cargar 200h de historial real desde market_data ---
+        # Esto permite calcular lag_24h y lag_168h correctamente
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            hist_rows = conn.execute(text("""
+                SELECT timestamp, spot_price_cop, demand_mwh,
+                       hydrology_pct, reservoir_level_pct, thermal_dispatch_pct
+                FROM market_data
+                WHERE agent_sic_code IS NULL
+                ORDER BY timestamp DESC
+                LIMIT 210
+            """)).fetchall()
 
-        # Crear filas futuras con valores de mercado proyectados
-        future_rows = []
-        for ts in future_timestamps:
-            future_rows.append({
-                "timestamp": ts,
-                "spot_price_cop": market_context["spot_price_cop"],
-                "demand_mwh": market_context["demand_mwh"],
-                "hydrology_pct": market_context["hydrology_pct"],
-                "reservoir_level_pct": market_context["reservoir_level_pct"],
-                "thermal_dispatch_pct": market_context["thermal_dispatch_pct"],
-            })
+        if not hist_rows:
+            logger.warning("Sin datos históricos en market_data — omitiendo predicción")
+            return {}
 
-        future_df = pd.DataFrame(future_rows)
+        hist_df = pd.DataFrame(hist_rows, columns=[
+            "timestamp", "spot_price_cop", "demand_mwh",
+            "hydrology_pct", "reservoir_level_pct", "thermal_dispatch_pct",
+        ])
+        hist_df = hist_df.sort_values("timestamp").reset_index(drop=True)
+        hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"])
 
-        # Combinar histórico + futuro para calcular lags
-        combined = pd.concat([history.assign(
-            demand_mwh=market_context["demand_mwh"],
-            hydrology_pct=market_context["hydrology_pct"],
-            reservoir_level_pct=market_context["reservoir_level_pct"],
-            thermal_dispatch_pct=market_context["thermal_dispatch_pct"],
-        ), future_df], ignore_index=True)
+        # Escalar hidro/embalse si están como fracción (0-1) en lugar de porcentaje
+        if hist_df["hydrology_pct"].max() <= 3.0:
+            hist_df["hydrology_pct"] *= 100.0
+        if hist_df["reservoir_level_pct"].max() <= 1.0:
+            hist_df["reservoir_level_pct"] *= 100.0
 
+        # --- Construir filas futuras (próximas 24 horas) ---
+        latest_ts = hist_df["timestamp"].iloc[-1]
+        if latest_ts.tzinfo is None:
+            latest_ts = latest_ts.tz_localize("UTC")
+        future_timestamps = [latest_ts + timedelta(hours=h) for h in range(1, 25)]
+
+        latest = hist_df.iloc[-1]
+        future_rows = pd.DataFrame([{
+            "timestamp": ts,
+            "spot_price_cop": float(latest["spot_price_cop"]),
+            "demand_mwh": float(latest["demand_mwh"]),
+            "hydrology_pct": float(latest["hydrology_pct"]),
+            "reservoir_level_pct": float(latest["reservoir_level_pct"]),
+            "thermal_dispatch_pct": float(latest["thermal_dispatch_pct"]),
+        } for ts in future_timestamps])
+
+        combined = pd.concat([hist_df, future_rows], ignore_index=True)
         combined["timestamp"] = pd.to_datetime(combined["timestamp"])
-        feature_df = build_feature_matrix(combined, drop_na=False)
 
-        # Solo predecir filas futuras
+        feature_df = build_feature_matrix(combined, drop_na=False)
         future_features = feature_df[feature_df["timestamp"].isin(future_timestamps)].copy()
         future_features = future_features.dropna(subset=PRICE_PREDICTION_FEATURES[:10])
 
@@ -199,34 +223,72 @@ def llm_analysis_dag():
             logger.warning("No hay features válidas para predicción futura")
             return {}
 
+        # Imputar NaN restantes con 0 para features opcionales
+        for feat in PRICE_PREDICTION_FEATURES:
+            if feat not in future_features.columns:
+                future_features[feat] = 0.0
+        future_features[PRICE_PREDICTION_FEATURES] = (
+            future_features[PRICE_PREDICTION_FEATURES].fillna(0.0)
+        )
+
         X = future_features[PRICE_PREDICTION_FEATURES]
         preds, lower, upper = model.predict_with_intervals(X)
 
         predictions = []
         for i, ts in enumerate(future_features["timestamp"]):
+            h = pd.to_datetime(ts).hour
             predictions.append({
-                "timestamp": str(ts),
+                # Formato esperado por pg_prediction_repository._hourly_to_domain
+                "target_hour": str(ts),
+                "predicted_cop": float(preds[i]),
+                "lower_bound_cop": float(lower[i]),
+                "upper_bound_cop": float(upper[i]),
+                "confidence": 0.7,
+                "is_peak_hour": 18 <= h < 21,
+                # Alias para uso en llm prompt (no se persiste por separado)
                 "predicted_price": float(preds[i]),
                 "lower_bound": float(lower[i]),
                 "upper_bound": float(upper[i]),
+                "timestamp": str(ts),
             })
 
-        logger.info("Predicciones generadas: %d horas | prom=%.2f COP",
-                    len(predictions),
-                    np.mean([p["predicted_price"] for p in predictions]))
+        avg_pred = float(np.mean([p["predicted_price"] for p in predictions]))
+        logger.info("Predicciones generadas: %d horas | prom=%.2f COP", len(predictions), avg_pred)
+
+        # --- Persistir predicciones en tabla predictions por agente ---
+        active_agents = market_context.get("active_agents", [])
+        now = datetime.now(timezone.utc)
+
+        if active_agents:
+            hourly_json = json.dumps(predictions)
+            with engine.begin() as conn:
+                for agent_sic in active_agents:
+                    conn.execute(text("""
+                        INSERT INTO predictions
+                            (id, agent_sic_code, generated_at, model_version_id,
+                             horizon_hours, hourly_predictions, actuals, overall_confidence)
+                        VALUES
+                            (:id::uuid, :sic, :generated_at, :model_id::uuid,
+                             24, CAST(:hourly AS json), CAST('[]' AS json), :confidence)
+                    """), {
+                        "id": str(uuid.uuid4()),
+                        "sic": agent_sic,
+                        "generated_at": now,
+                        "model_id": domain_model_id,
+                        "hourly": hourly_json,
+                        "confidence": 0.7,
+                    })
+            logger.info("Predicciones guardadas para %d agentes", len(active_agents))
 
         return {
             "predictions": predictions,
             "model_version": model_version,
             "model_metrics": model_metrics,
+            "domain_model_id": domain_model_id,
         }
 
-    @task(task_id="generate_llm_recommendation")
-    def generate_llm_recommendation(
-        market_context: dict,
-        prediction_result: dict,
-        agent_sic_code: str,
-    ) -> dict:
+    def _call_llm_for_agent(market_context: dict, prediction_result: dict, agent_sic_code: str) -> dict:
+        """Helper interno (no task): llama al LLM para un agente y retorna la recomendación."""
         """
         Construye prompt estructurado y llama a Deepseek para generar
         la recomendación de precio oferta para el agente.
@@ -355,11 +417,15 @@ PREDICCIONES DEL MODELO (próximas 24 horas):
             logger.error("Error llamando LLM (%s) para %s: %s", llm_model_name, agent_sic_code, e)
             raise
 
-    @task(task_id="store_recommendations")
-    def store_recommendations(recommendations: list[dict]) -> dict:
+    @task(task_id="generate_and_store_recommendations")
+    def generate_and_store_recommendations(
+        market_context: dict,
+        prediction_result: dict,
+    ) -> dict:
         """
-        Persiste las recomendaciones en PostgreSQL.
-        UPSERT por (agent_sic_code, created_at truncado a hora).
+        Itera sobre todos los agentes activos (leídos desde la BD),
+        llama al LLM para cada uno y persiste las recomendaciones en PostgreSQL.
+        Un único task evita los límites de XCom y el parseo dinámico de Airflow.
         """
         import sys, uuid, json
         sys.path.insert(0, "/opt/airflow")
@@ -367,65 +433,56 @@ PREDICCIONES DEL MODELO (próximas 24 horas):
         from datetime import datetime, timezone
         from sqlalchemy import text
 
-        valid = [r for r in recommendations if r and r.get("recommended_offer_price_cop")]
-        if not valid:
-            logger.warning("Sin recomendaciones válidas para almacenar")
-            return {"stored": 0}
+        active_agents = market_context.get("active_agents", ["EPMC"])
+        logger.info("Generando recomendaciones para %d agentes: %s", len(active_agents), active_agents)
 
+        stored = 0
         engine = get_db_engine()
         now = datetime.now(timezone.utc)
 
-        with engine.begin() as conn:
-            for rec in valid:
-                conn.execute(text("""
-                    INSERT INTO recommendations
-                        (id, agent_sic_code, prediction_id, model_version_id,
-                         recommended_offer_price_cop, confidence, risk_level,
-                         rationale, key_factors, hourly_offers,
-                         llm_model_used, created_at, valid_until)
-                    VALUES
-                        (:id, :sic, NULL, NULL,
-                         :price, :confidence, :risk,
-                         :rationale, :key_factors::jsonb, :hourly_offers::jsonb,
-                         :llm_model, :created_at, :valid_until)
-                    ON CONFLICT DO NOTHING
-                """), {
-                    "id": str(uuid.uuid4()),
-                    "sic": rec["agent_sic_code"],
-                    "price": rec["recommended_offer_price_cop"],
-                    "confidence": rec.get("confidence", "media"),
-                    "risk": rec.get("risk_level", "medium"),
-                    "rationale": rec.get("rationale", ""),
-                    "key_factors": json.dumps(rec.get("key_factors", [])),
-                    "hourly_offers": json.dumps(rec.get("hourly_strategy", {})),
-                    "llm_model": rec.get("llm_model_used", "deepseek-chat"),
-                    "created_at": now,
-                    "valid_until": now.replace(
-                        hour=now.hour + 1 if now.hour < 23 else 23,
-                        minute=0, second=0, microsecond=0
-                    ),
-                })
+        for agent_sic_code in active_agents:
+            try:
+                rec = _call_llm_for_agent(market_context, prediction_result, agent_sic_code)
+                if not rec or not rec.get("recommended_offer_price_cop"):
+                    logger.warning("Sin recomendación válida para %s", agent_sic_code)
+                    continue
 
-        logger.info("Recomendaciones almacenadas: %d", len(valid))
-        return {"stored": len(valid), "agents": [r["agent_sic_code"] for r in valid]}
+                with engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO recommendations
+                            (id, agent_sic_code, prediction_id, model_version_id,
+                             risk_level, narrative, key_factors, hourly_offers,
+                             llm_model_used, generated_at)
+                        VALUES
+                            (:id, :sic, NULL, NULL,
+                             :risk, :narrative, CAST(:key_factors AS json), CAST(:hourly_offers AS json),
+                             :llm_model, :generated_at)
+                        ON CONFLICT DO NOTHING
+                    """), {
+                        "id": str(uuid.uuid4()),
+                        "sic": agent_sic_code,
+                        "risk": rec.get("risk_level", "medium"),
+                        "narrative": rec.get("rationale", ""),
+                        "key_factors": json.dumps(rec.get("key_factors", [])),
+                        "hourly_offers": json.dumps(rec.get("hourly_strategy", {})),
+                        "llm_model": rec.get("llm_model_used", "deepseek-chat"),
+                        "generated_at": now,
+                    })
+                stored += 1
+                logger.info("Recomendación almacenada para %s", agent_sic_code)
+
+            except Exception as exc:
+                logger.error("Error procesando agente %s: %s", agent_sic_code, exc)
+
+        logger.info("Total recomendaciones almacenadas: %d / %d", stored, len(active_agents))
+        return {"stored": stored, "agents": active_agents}
 
     # ------------------------------------------------------------------
     # Grafo de dependencias
     # ------------------------------------------------------------------
     market_ctx = load_market_context()
     prediction = load_champion_and_predict(market_ctx)
-
-    # Generar recomendaciones para cada agente activo
-    recs = [
-        generate_llm_recommendation(
-            market_context=market_ctx,
-            prediction_result=prediction,
-            agent_sic_code=sic_code,
-        )
-        for sic_code in ACTIVE_AGENTS
-    ]
-
-    store_recommendations(recs)
+    generate_and_store_recommendations(market_ctx, prediction)
 
 
 llm_analysis_dag()

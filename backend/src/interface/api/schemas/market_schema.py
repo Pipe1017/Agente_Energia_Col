@@ -14,6 +14,13 @@ class MarketSnapshotResponse(BaseModel):
     thermal_dispatch_pct: float = Field(description="Participación térmica en el despacho (%)")
     agent_sic_code: str | None = Field(None, description="SIC del agente (None = sistema general)")
 
+    # Generación por tecnología (GWh/día — fuente SIMEM)
+    precio_escasez_cop: float | None = Field(None, description="Precio de escasez (COP/kWh)")
+    gen_hidraulica_gwh: float | None = Field(None, description="Generación hidráulica (GWh/día)")
+    gen_termica_gwh: float | None = Field(None, description="Generación térmica (GWh/día)")
+    gen_solar_gwh: float | None = Field(None, description="Generación solar (GWh/día)")
+    gen_eolica_gwh: float | None = Field(None, description="Generación eólica (GWh/día)")
+
     # Campos derivados calculados en el dominio
     hydrology_status: str = Field(description="Estado hidrológico: crítica/baja/normal/alta")
     is_hydrology_critical: bool

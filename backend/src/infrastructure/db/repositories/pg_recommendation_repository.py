@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, time, timezone
 from uuid import UUID
 
 from sqlalchemy import select
@@ -9,6 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ....domain.entities.recommendation import HourlyOffer, Recommendation, RiskLevel
 from ....domain.repositories.i_recommendation_repository import IRecommendationRepository
 from ..models.recommendation_model import RecommendationModel
+
+# Mapa de franjas horarias del LLM → hora representativa y etiqueta
+_BUCKET_HOUR = {"off_peak": 3, "mid_peak": 12, "peak": 20}
+_BUCKET_LABEL = {
+    "off_peak": "Franja valle (00-06h)",
+    "mid_peak": "Franja media (06-18h)",
+    "peak": "Franja pico (18-23h)",
+}
 
 
 class PgRecommendationRepository(IRecommendationRepository):
@@ -32,6 +40,39 @@ class PgRecommendationRepository(IRecommendationRepository):
             "reasoning": o.reasoning,
         }
 
+    @staticmethod
+    def _parse_hourly_offers(raw) -> list[HourlyOffer]:
+        """Convierte hourly_offers de la BD al formato de dominio.
+
+        Soporta dos formatos:
+        - Lista: [{"hour": "...", "suggested_price_cop": ..., "reasoning": "..."}]
+        - Dict plano del LLM: {"off_peak": 210.0, "mid_peak": 240.0, "peak": 280.0}
+        """
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            return [
+                HourlyOffer(
+                    hour=datetime.fromisoformat(o["hour"]),
+                    suggested_price_cop=o["suggested_price_cop"],
+                    reasoning=o["reasoning"],
+                )
+                for o in raw
+            ]
+        # Dict plano: {"off_peak": 210.0, ...}
+        today = date.today()
+        result = []
+        for bucket, price in raw.items():
+            hour_num = _BUCKET_HOUR.get(bucket, 12)
+            label = _BUCKET_LABEL.get(bucket, bucket)
+            ts = datetime.combine(today, time(hour=hour_num), tzinfo=timezone.utc)
+            result.append(HourlyOffer(
+                hour=ts,
+                suggested_price_cop=float(price),
+                reasoning=label,
+            ))
+        return result
+
     def _to_domain(self, row: RecommendationModel) -> Recommendation:
         return Recommendation(
             id=row.id,
@@ -39,7 +80,7 @@ class PgRecommendationRepository(IRecommendationRepository):
             generated_at=row.generated_at,
             prediction_id=row.prediction_id,
             narrative=row.narrative,
-            hourly_offers=[self._offer_to_domain(o) for o in row.hourly_offers],
+            hourly_offers=self._parse_hourly_offers(row.hourly_offers),
             risk_level=RiskLevel(row.risk_level),
             key_factors=list(row.key_factors),
             llm_model_used=row.llm_model_used,

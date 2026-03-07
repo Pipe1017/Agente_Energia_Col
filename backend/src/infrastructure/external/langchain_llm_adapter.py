@@ -30,7 +30,7 @@ from .deepseek_adapter import SYSTEM_PROMPT, _build_user_prompt
 logger = logging.getLogger(__name__)
 
 
-def _build_chat_model(settings: Settings) -> BaseChatModel:
+def _build_chat_model(settings: Settings, json_mode: bool = True) -> BaseChatModel:
     """
     Factory que instancia el ChatModel correcto según LLM_PROVIDER.
     Soporta hot-swap entre Deepseek (prod) y Ollama (dev) sin tocar el dominio.
@@ -52,25 +52,27 @@ def _build_chat_model(settings: Settings) -> BaseChatModel:
         from langchain_openai import ChatOpenAI  # type: ignore[import-untyped]
 
         logger.info("LLM provider: OpenAI (%s)", settings.DEEPSEEK_MODEL)
+        kwargs = {"model_kwargs": {"response_format": {"type": "json_object"}}} if json_mode else {}
         return ChatOpenAI(
-            api_key=settings.DEEPSEEK_API_KEY,  # reutiliza campo; puede añadir OPENAI_API_KEY
+            api_key=settings.DEEPSEEK_API_KEY,
             model=settings.DEEPSEEK_MODEL,
             temperature=settings.DEEPSEEK_TEMPERATURE,
             max_tokens=settings.DEEPSEEK_MAX_TOKENS,
-            model_kwargs={"response_format": {"type": "json_object"}},
+            **kwargs,
         )
 
     # Default: Deepseek (protocolo OpenAI-compatible)
     from langchain_openai import ChatOpenAI  # type: ignore[import-untyped]
 
-    logger.info("LLM provider: Deepseek (%s)", settings.DEEPSEEK_MODEL)
+    logger.info("LLM provider: Deepseek (%s) json_mode=%s", settings.DEEPSEEK_MODEL, json_mode)
+    kwargs = {"model_kwargs": {"response_format": {"type": "json_object"}}} if json_mode else {}
     return ChatOpenAI(
         api_key=settings.DEEPSEEK_API_KEY,
         base_url=settings.DEEPSEEK_BASE_URL,
         model=settings.DEEPSEEK_MODEL,
         temperature=settings.DEEPSEEK_TEMPERATURE,
         max_tokens=settings.DEEPSEEK_MAX_TOKENS,
-        model_kwargs={"response_format": {"type": "json_object"}},
+        **kwargs,
     )
 
 
@@ -82,7 +84,8 @@ class LangChainLLMAdapter(ILLMService):
     """
 
     def __init__(self, settings: Settings) -> None:
-        self._llm = _build_chat_model(settings)
+        self._llm = _build_chat_model(settings, json_mode=True)   # para recommendations (JSON)
+        self._chat_llm = _build_chat_model(settings, json_mode=False)  # para chat libre (texto)
         self._settings = settings
 
     async def generate_recommendation(
@@ -152,6 +155,34 @@ class LangChainLLMAdapter(ILLMService):
             key_factors=data.get("key_factors", []),
             llm_model_used=model_name,
         )
+
+    async def chat(self, system_prompt: str, user_message: str, history: list[dict] | None = None) -> str:
+        """Chat libre con el LLM, con system prompt personalizable y historial opcional."""
+        from langchain_core.messages import AIMessage
+
+        messages = [SystemMessage(content=system_prompt)]
+        for turn in (history or []):
+            if turn.get("role") == "user":
+                messages.append(HumanMessage(content=turn["content"]))
+            elif turn.get("role") == "assistant":
+                messages.append(AIMessage(content=turn["content"]))
+        messages.append(HumanMessage(content=user_message))
+
+        try:
+            response = await self._chat_llm.ainvoke(messages)
+        except Exception as exc:
+            logger.error("Error en chat LLM (%s): %s", self._settings.LLM_PROVIDER, exc)
+            raise RuntimeError(f"LLM no disponible: {exc}") from exc
+
+        content = response.content if hasattr(response, "content") else str(response)
+        # Si el LLM devuelve JSON (modo json_object forzado), intentar extraer texto
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                content = parsed.get("response") or parsed.get("answer") or parsed.get("text") or content
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return str(content)
 
     async def health_check(self) -> bool:
         try:

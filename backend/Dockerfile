@@ -19,9 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Instalar dependencias Python en capa separada (mejor cache)
+# src/ vacío permite a hatchling resolver deps sin copiar el código fuente todavía
 COPY pyproject.toml .
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir ".[dev]"
+RUN mkdir -p src && \
+    pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir ".[dev]"
 
 # ------------------------------------------------------------
 # Stage development — hot reload, sin copiar código fuente
@@ -34,7 +36,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 8000 5678
 
-CMD ["uvicorn", "src.interfaces.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 
 # ------------------------------------------------------------
 # Stage production — imagen mínima, usuario no-root
@@ -45,6 +47,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # Copiar solo código fuente
+COPY main.py .
 COPY src/ ./src/
 COPY alembic.ini .
 
@@ -58,4 +61,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/api/v1/health || exit 1
 
-CMD ["uvicorn", "src.interfaces.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

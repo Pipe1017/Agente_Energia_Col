@@ -6,7 +6,10 @@
 
 # YAML anchor: configuración común de todos los servicios Airflow
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.9.3-python3.11
+  build:
+    context: ..
+    dockerfile: infra/docker/airflow/Dockerfile
+  image: infra-airflow-custom:latest
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${AIRFLOW_DB:-airflow}
@@ -38,7 +41,8 @@ x-airflow-common: &airflow-common
     MLFLOW_S3_ENDPOINT_URL: http://minio:9000
     AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
     AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
-    _PIP_ADDITIONAL_REQUIREMENTS: "pydataxm>=0.5 minio boto3 pandas>=2.0 scikit-learn xgboost>=2.0 httpx mlflow>=2.13 langchain>=0.3 langchain-openai>=0.2 langchain-ollama>=0.2 langchain-core>=0.3"
+    # Dependencias pre-instaladas en la imagen custom (infra/docker/airflow/Dockerfile)
+    # Ya no se usa _PIP_ADDITIONAL_REQUIREMENTS para evitar reinstalación en cada arranque
   volumes:
     - ../orchestration/dags:/opt/airflow/dags:ro
     - ../orchestration/plugins:/opt/airflow/plugins:ro
@@ -144,15 +148,16 @@ services:
       mlflow server
         --host 0.0.0.0
         --port 5000
-        --backend-store-uri postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+        --backend-store-uri postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/mlflow
         --default-artifact-root s3://mlflow/
         --serve-artifacts
+        --allowed-hosts '*'
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     ports:
-      - "${MLFLOW_PORT:-5000}:5000"
+      - "${MLFLOW_PORT:-5050}:5000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -170,18 +175,19 @@ services:
 
   airflow-init:
     <<: *airflow-common
-    command: >
-      bash -c "
+    command:
+      - bash
+      - -c
+      - |
         airflow db migrate &&
-        airflow users create
-          --username ${AIRFLOW_ADMIN_USER:-admin}
-          --password ${AIRFLOW_ADMIN_PASSWORD:-admin}
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email admin@energia-col.local
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-admin}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@energia-col.local \
         || true
-      "
     healthcheck:
       disable: true
     restart: "no"
@@ -206,7 +212,7 @@ services:
     <<: *airflow-common
     command: scheduler
     healthcheck:
-      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$${HOSTNAME}"]
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $$(hostname)"]
       interval: 30s
       timeout: 10s
       retries: 5

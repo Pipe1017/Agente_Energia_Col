@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from ...config import get_settings
-from .routers import agents, market, models, predictions, recommendations
+from .routers import agents, chat, market, models, predictions, recommendations
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,7 @@ def create_app() -> FastAPI:
     app.include_router(predictions.router, prefix=API_V1)
     app.include_router(recommendations.router, prefix=API_V1)
     app.include_router(models.router, prefix=API_V1)
+    app.include_router(chat.router, prefix=API_V1)
 
     # ------------------------------------------------------------------
     # Health check (sin prefijo de versión para load balancers)

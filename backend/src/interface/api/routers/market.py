@@ -30,6 +30,11 @@ def _snapshot_to_response(s: MarketSnapshot) -> MarketSnapshotResponse:
         reservoir_level_pct=s.reservoir_level_pct,
         thermal_dispatch_pct=s.thermal_dispatch_pct,
         agent_sic_code=s.agent_sic_code,
+        precio_escasez_cop=s.precio_escasez_cop,
+        gen_hidraulica_gwh=s.gen_hidraulica_gwh,
+        gen_termica_gwh=s.gen_termica_gwh,
+        gen_solar_gwh=s.gen_solar_gwh,
+        gen_eolica_gwh=s.gen_eolica_gwh,
         hydrology_status=s.hydrology_status,
         is_hydrology_critical=s.is_hydrology_critical,
         is_reservoir_low=s.is_reservoir_low,
@@ -90,10 +95,10 @@ async def get_last_n_hours(
     repo: MarketRepoDep,
     agent: Annotated[str | None, Query()] = None,
 ) -> list[MarketSnapshotResponse]:
-    if not (1 <= hours <= 720):
+    if not (1 <= hours <= 2160):  # hasta 90 días
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="hours debe estar entre 1 y 720",
+            detail="hours debe estar entre 1 y 2160",
         )
     snapshots = await GetMarketLastNHours(repo).execute(hours=hours, agent_sic_code=agent)
     return [_snapshot_to_response(s) for s in snapshots]

@@ -5,6 +5,10 @@ Los lags capturan la autocorrelación del precio de bolsa:
   - lag_1h:   precio de la hora anterior (correlación ~0.95 en el corto plazo)
   - lag_24h:  mismo bloque horario del día anterior (patrón diario)
   - lag_168h: mismo bloque horario de la semana anterior (patrón semanal)
+
+Variables derivadas clave (del análisis exploratorio):
+  - ratio_termico_hidro: Termica / (Hidraulica + 1) — driver principal del precio
+  - precio_escasez_spread: precio_bolsa - precio_escasez — señal de activación de escasez
 """
 from __future__ import annotations
 
@@ -16,10 +20,11 @@ def add_lag_features(
     price_col: str = "spot_price_cop",
     demand_col: str = "demand_mwh",
     hydrology_col: str = "hydrology_pct",
+    reservoir_col: str = "reservoir_level_pct",
     sort_col: str = "timestamp",
 ) -> pd.DataFrame:
     """
-    Agrega lags y rolling stats al DataFrame.
+    Agrega lags, rolling stats y variables derivadas al DataFrame.
     Requiere que el DataFrame esté ordenado por timestamp (o sort_col).
     Los primeros N registros tendrán NaN en los lags correspondientes.
     """
@@ -51,10 +56,51 @@ def add_lag_features(
         df["demand_lag_24h"] = df[demand_col].shift(24)
         df["demand_rolling_mean_24h"] = df[demand_col].rolling(24, min_periods=12).mean()
 
-    # -- Rolling de hidrología (varía lento — ventana más larga) --
+    # -- Rolling de hidrología (varía lento — ventanas corta, media y larga) --
     if hydrology_col in df.columns:
-        df["hydrology_rolling_mean_7d"] = df[hydrology_col].rolling(168, min_periods=24).mean()
-        df["hydrology_trend_7d"] = df[hydrology_col] - df["hydrology_rolling_mean_7d"]
+        df["hydrology_rolling_mean_7d"]  = df[hydrology_col].rolling(168,  min_periods=24).mean()
+        df["hydrology_trend_7d"]         = df[hydrology_col] - df["hydrology_rolling_mean_7d"]
+
+        # Ventanas largas: señal de sequía / El Niño (requieren historial)
+        df["hydrology_rolling_mean_30d"] = df[hydrology_col].rolling(720,  min_periods=168).mean()
+        df["hydrology_rolling_mean_90d"] = df[hydrology_col].rolling(2160, min_periods=336).mean()
+
+        # Tendencia hidrológica: positivo = mejorando respecto a trimestre
+        # Negativo = empeorando (señal de sequía inminente → precios al alza)
+        df["hydrology_trend_30d"] = (
+            df["hydrology_rolling_mean_30d"] - df["hydrology_rolling_mean_90d"]
+        )
+
+    # -- Lags de nivel de embalse (otro indicador hídrico lento) --
+    if reservoir_col in df.columns:
+        df["reservoir_lag_24h"] = df[reservoir_col].shift(24)
+        df["reservoir_rolling_mean_7d"] = df[reservoir_col].rolling(168, min_periods=24).mean()
+
+    # -- Percentil de precio en distribución histórica --
+    # price_percentile_30d ≈ 1.0 → precio alto vs. último mes (señal de tensión)
+    # price_percentile_365d ≈ 1.0 → precio alto en contexto anual
+    df["price_percentile_30d"]  = (
+        df[price_col].rolling(720,  min_periods=168).rank(pct=True)
+    )
+    df["price_percentile_365d"] = (
+        df[price_col].rolling(8760, min_periods=720).rank(pct=True)
+    )
+
+    # -- Ratio Térmico/Hidráulico (key driver según análisis SIMEM) --
+    # Termica / (Hidraulica + 1) — evita división por cero
+    if "gen_termica_gwh" in df.columns and "gen_hidraulica_gwh" in df.columns:
+        hidro = df["gen_hidraulica_gwh"].fillna(0)
+        term = df["gen_termica_gwh"].fillna(0)
+        df["ratio_termico_hidro"] = term / (hidro + 1.0)
+        df["ratio_termico_hidro_lag_24h"] = df["ratio_termico_hidro"].shift(24)
+        df["ratio_termico_hidro_rolling_7d"] = df["ratio_termico_hidro"].rolling(168, min_periods=24).mean()
+
+    # -- Spread precio vs precio de escasez (señal regulatoria) --
+    if "precio_escasez_cop" in df.columns:
+        # Forward-fill: el precio de escasez es diario, se aplica a todas las horas
+        escasez = df["precio_escasez_cop"].ffill()
+        df["precio_escasez_cop_ff"] = escasez
+        df["precio_escasez_spread"] = df[price_col] - escasez  # >0 → precio sobre escasez
 
     return df
 
@@ -71,12 +117,10 @@ def prepare_prediction_features(
     historical_df: datos reales hasta el momento actual
     future_timestamps: timestamps de las próximas 24 horas a predecir
     """
-    # Añadir filas vacías para el futuro
     future_rows = pd.DataFrame({"timestamp": future_timestamps})
     future_rows[price_col] = float("nan")   # precio futuro = desconocido
 
     combined = pd.concat([historical_df, future_rows], ignore_index=True)
     combined = add_lag_features(combined, price_col=price_col)
 
-    # Retornar solo las filas futuras con sus features ya calculadas
     return combined[combined["timestamp"].isin(future_timestamps)].copy()

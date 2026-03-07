@@ -17,6 +17,7 @@ from src.config import get_settings
 from src.infrastructure.db.base import Base
 from src.infrastructure.db.models import (  # noqa: F401
     AgentModel,
+    FeatureCacheModel,
     MarketDataModel,
     ModelVersionModel,
     PredictionModel,

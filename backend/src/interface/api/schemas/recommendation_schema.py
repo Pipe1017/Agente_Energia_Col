@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from uuid import UUID
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -19,7 +20,7 @@ class RecommendationResponse(BaseModel):
     id: UUID
     agent_sic_code: str
     generated_at: datetime
-    prediction_id: UUID
+    prediction_id: Optional[UUID] = None
     narrative: str = Field(description="Análisis narrativo completo del LLM")
     risk_level: str = Field(description="low | medium | high")
     key_factors: list[str] = Field(description="Factores clave que influyen la recomendación")

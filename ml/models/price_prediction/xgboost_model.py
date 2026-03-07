@@ -21,8 +21,8 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 
-from ..base_model import BaseEnergyModel
-from ...features.feature_pipeline import PRICE_PREDICTION_FEATURES
+from models.base_model import BaseEnergyModel
+from features.feature_pipeline import PRICE_PREDICTION_FEATURES
 
 logger = logging.getLogger(__name__)
 
@@ -80,23 +80,39 @@ class XGBoostPriceModel(BaseEnergyModel):
         params: dict[str, Any] | None = None,
         X_val: pd.DataFrame | None = None,
         y_val: pd.Series | None = None,
+        sample_weight: np.ndarray | None = None,
     ) -> None:
+        """
+        Entrena los 3 modelos cuantiles (q=0.05, 0.50, 0.95).
+
+        Args:
+            sample_weight: pesos por muestra para decaimiento temporal.
+                Use feature_pipeline.compute_sample_weights() para generarlos.
+                Si None, todas las muestras tienen peso igual.
+        """
         X_train = self.select_features(X_train)
         merged_params = {**DEFAULT_PARAMS, **(params or {})}
         self._trained_params = merged_params
 
         eval_set = [(X_val[self.feature_schema], y_val)] if X_val is not None else None
-        fit_kwargs: dict[str, Any] = {}
+        fit_kwargs_mid: dict[str, Any] = {}
         if eval_set:
-            fit_kwargs["eval_set"] = eval_set
-            fit_kwargs["verbose"] = 100
+            fit_kwargs_mid["eval_set"] = eval_set
+            fit_kwargs_mid["verbose"] = 100
+        if sample_weight is not None:
+            fit_kwargs_mid["sample_weight"] = sample_weight
 
-        logger.info("Entrenando XGBoost central (q=0.50) con %d muestras...", len(X_train))
+        n_samples = len(X_train)
+        weight_info = " con pesos temporales" if sample_weight is not None else ""
+        logger.info(
+            "Entrenando XGBoost central (q=0.50) con %d muestras%s...",
+            n_samples, weight_info,
+        )
         self._model_mid = XGBRegressor(
             **{k: v for k, v in merged_params.items() if k != "early_stopping_rounds"},
             objective="reg:squarederror",
         )
-        self._model_mid.fit(X_train, y_train, **fit_kwargs)
+        self._model_mid.fit(X_train, y_train, **fit_kwargs_mid)
 
         logger.info("Entrenando modelo de límite inferior (q=0.05)...")
         self._model_low = XGBRegressor(
@@ -104,7 +120,10 @@ class XGBoostPriceModel(BaseEnergyModel):
             objective="reg:quantileerror",
             quantile_alpha=0.05,
         )
-        self._model_low.fit(X_train, y_train)
+        self._model_low.fit(
+            X_train, y_train,
+            sample_weight=sample_weight,
+        )
 
         logger.info("Entrenando modelo de límite superior (q=0.95)...")
         self._model_high = XGBRegressor(
@@ -112,7 +131,10 @@ class XGBoostPriceModel(BaseEnergyModel):
             objective="reg:quantileerror",
             quantile_alpha=0.95,
         )
-        self._model_high.fit(X_train, y_train)
+        self._model_high.fit(
+            X_train, y_train,
+            sample_weight=sample_weight,
+        )
 
         # Feature importance desde el modelo central
         importances = self._model_mid.feature_importances_

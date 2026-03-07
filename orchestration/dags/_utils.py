@@ -68,25 +68,45 @@ def get_or_create_mlflow_experiment(name: str) -> str:
     )
 
 
-def fetch_date_range(lookback_days: int = 2) -> tuple[date, date]:
+def fetch_date_range(lookback_days: int = 2, end_offset_days: int = 2) -> tuple[date, date]:
     """
-    Rango de fechas para ingestion: hoy - lookback_days hasta hoy.
-    Siempre re-descargamos los últimos días para garantizar completitud.
+    Rango de fechas para ingestion.
+    XM publica datos con ~2 días de lag, por eso el end date es
+    hoy - end_offset_days (default=2) en lugar de hoy.
     """
-    end = date.today()
+    end = date.today() - timedelta(days=end_offset_days)
     start = end - timedelta(days=lookback_days)
     return start, end
 
 
-def xm_df_to_hourly(df, value_col: str, date_col: str = "Date", hour_col: str = "Hour") -> dict:
+def xm_df_to_hourly(df, value_col: str = None, date_col: str = "Date", hour_col: str = "Hour") -> dict:
     """
-    Convierte un DataFrame de pydataxm (Date + Hour + Values)
-    a dict {pd.Timestamp: valor} para el merge.
-    pydataxm retorna horas como enteros 1–24 → convertir a 0-23.
+    Convierte DataFrame de pydataxm a dict {pd.Timestamp: valor}.
+    Soporta formato wide (Values_Hour01..Values_Hour24, pydataxm>=0.3)
+    y formato tall (Date + Hour + valor, versiones antiguas).
     """
     import pandas as pd
 
     result = {}
+    hour_cols = sorted([c for c in df.columns if c.startswith("Values_Hour")])
+
+    if hour_cols:
+        # Formato wide: una fila por fecha, columna por hora
+        for _, row in df.iterrows():
+            try:
+                d = pd.Timestamp(str(row[date_col]))
+            except (ValueError, KeyError):
+                continue
+            for hcol in hour_cols:
+                try:
+                    hour_num = int(hcol.replace("Values_Hour", "")) - 1
+                    ts = d.replace(hour=hour_num, minute=0, second=0, microsecond=0)
+                    result[ts] = float(row[hcol])
+                except (ValueError, TypeError):
+                    continue
+        return result
+
+    # Formato tall (versiones anteriores de pydataxm)
     for _, row in df.iterrows():
         try:
             hour = int(row[hour_col]) - 1
@@ -97,12 +117,17 @@ def xm_df_to_hourly(df, value_col: str, date_col: str = "Date", hour_col: str = 
     return result
 
 
-def xm_df_to_daily(df, value_col: str, date_col: str = "Date") -> dict:
+def xm_df_to_daily(df, value_col: str = None, date_col: str = "Date") -> dict:
     """
     Convierte DataFrame diario (sin hora) a dict {date: valor}.
-    Se replica para todas las horas del día en el merge.
+    Detecta automáticamente la columna de valor si no se especifica.
     """
     import pandas as pd
+
+    if value_col is None:
+        # La columna numérica que no sea Id ni Date
+        candidates = [c for c in df.columns if c not in (date_col, "Id", "Values_code")]
+        value_col = candidates[0] if candidates else "Value"
 
     result = {}
     for _, row in df.iterrows():

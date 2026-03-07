@@ -69,7 +69,7 @@ class PgAgentRepository(IAgentRepository):
 
     async def save(self, agent: Agent) -> Agent:
         orm = self._to_orm(agent)
-        self._session.add(orm)
+        await self._session.merge(orm)  # INSERT OR UPDATE por primary key
         await self._session.flush()
         return agent
 
